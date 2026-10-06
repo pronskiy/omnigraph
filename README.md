@@ -32,7 +32,7 @@ Run it as a server, declared as code; hundreds of agents operate and enrich the 
     <source media="(prefers-reduced-motion: reduce) and (prefers-color-scheme: dark)" srcset="assets/readme/hero-dark.png">
     <source media="(prefers-reduced-motion: reduce)" srcset="assets/readme/hero-light.png">
     <source media="(prefers-color-scheme: dark)" srcset="assets/readme/hero-dark.webp">
-    <img alt="A terminal asks Omnigraph when Decision_1 was made and by whom, who it affects, and what else is changing Project_X; beside it, the company graph lights each answer the way its query walks it" src="assets/readme/hero-light.webp" width="770">
+    <img alt="A terminal asks Omnigraph when Decision_1 was made and by whom, who it affects, and what else is changing Project_X; beside it, the company graph lights each answer the way its query walks it" src="assets/readme/hero-light.webp">
   </picture>
 </p>
 
