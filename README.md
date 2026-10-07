@@ -29,8 +29,10 @@ Run it as a server, declared as code; hundreds of agents operate and enrich the 
 
 <p align="center">
   <picture>
-    <source media="(prefers-reduced-motion: reduce)" srcset="assets/readme/hero.png">
-    <img alt="One dark terminal window: four agents write to the same Omnigraph company graph at once, each in its own pane and on its own branch; three merge into main, and main refuses the fourth, a decision that contradicts one already merged; beside them, the graph grows as each write lands and marks the refused one" src="assets/readme/hero.webp">
+    <source media="(prefers-reduced-motion: reduce) and (prefers-color-scheme: dark)" srcset="assets/readme/hero-dark.png">
+    <source media="(prefers-reduced-motion: reduce)" srcset="assets/readme/hero-light.png">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/readme/hero-dark.webp">
+    <img alt="Six agents write to the same Omnigraph company graph at once, each on its own branch: five one-line terminals add people, projects and a decision and merge into main one by one; a sixth records a decision that contradicts one already merged, and main refuses its merge; beside them, the company graph grows as each write lands on its branch and then on main, and the refused one stays on its branch, marked conflict, as the rest dims" src="assets/readme/hero-light.webp">
   </picture>
 </p>
 
