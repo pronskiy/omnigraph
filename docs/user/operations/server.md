@@ -237,6 +237,17 @@ describes sign-in, which resource identifier to choose, and the endpoint's tools
 | `/graphs/{graph_id}/export` | Stream a branch snapshot as JSONL |
 | `/graphs/{graph_id}/operations` | Submit a [recorded](recorded-operations.md) optimize (`POST /operations/optimize`), look one up (`GET /operations/{operation_id}`) or cancel it (`POST /operations/{operation_id}/cancel`); off unless `OMNIGRAPH_OPERATION_ROUTES=true` |
 
+An export or `changes baseline` stream holds the graph's one export slot,
+which refuses branch create and delete, other exports and served optimize, and
+holds its request on the graph, which a deployment drains before it activates.
+A client that takes no data for 30 seconds loses the stream: the server stops
+producing, frees the slot, and ends the body with an error instead of a clean
+end. The connection itself closes once a write has waited on the client for
+`OMNIGRAPH_WRITE_STALL_TIMEOUT_SECONDS` (60 by default; see
+[admission limits](../deployment.md#admission-limits)), which releases the
+request's hold on the graph. Read a stream steadily, or read it to a file
+first.
+
 `/query` also serves `branch list`, the branch reads (`branch diff`, `branch merge-base`, `branch merge … dry run`), `show`, and [explain](../queries/explain.md).
 `/mutate` serves `branch create`, `branch delete`, `branch merge`, `commit publish`,
 and `commit drop`. See [Branching](../branching/index.md).

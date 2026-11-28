@@ -118,6 +118,8 @@ resumed feed.
 HTTP uses `GET /graphs/{id}/changes` for polling and
 `POST /graphs/{id}/changes/baseline` for the snapshot handshake. Snapshot entity
 records use the export envelope with top-level `id`, separate from user `data`.
+A served baseline or export stream ends with an error if its client takes no
+data for 30 s, so read it straight to a file rather than pausing mid-stream.
 
 On POSIX, CLI `--out` syncs and atomically replaces the snapshot file before it
 prints the handshake to JSON stdout. Baselines require Cedar `export`; commit

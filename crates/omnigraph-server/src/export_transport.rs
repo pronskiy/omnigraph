@@ -4,7 +4,7 @@ use omnigraph::db::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
 use omnigraph::error::{OmniError, Result};
 use std::io::{self, Write};
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -25,6 +25,14 @@ pub(crate) const EXPORT_QUEUE_RESERVED_BYTES: usize =
 pub(crate) const EXPORT_PROCESS_QUEUE_RESERVED_BYTES: usize = 8 * EXPORT_QUEUE_RESERVED_BYTES;
 /// A saturated request waits only briefly for a queue reservation.
 pub(crate) const EXPORT_RESERVATION_TIMEOUT: Duration = Duration::from_millis(250);
+/// How long a stream's consumer may leave its next frame untaken. A client
+/// that stops reading for longer loses the stream: the producer stops, and
+/// the export cut it holds (which refuses branch create and delete, other
+/// exports and optimize on the graph) and its request's hold on the graph
+/// are released instead of lasting as long as the connection.
+pub(crate) const EXPORT_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// The body error of a stream whose consumer stalled past the deadline.
+const SERVED_STREAM_STALLED: &str = "served stream stalled: the client stopped reading";
 /// The body error of a stream that failed after its 200 headers. The client
 /// reads no text from it; the server's HTTP trace layer logs it.
 const SERVED_STREAM_FAILED: &str = "served stream failed after response headers";
@@ -110,6 +118,8 @@ pub(crate) struct ExportQueueLease {
 pub(crate) struct ExportSender {
     sender: mpsc::Sender<ExportFrame>,
     lease: Arc<ExportQueueLease>,
+    /// [`EXPORT_STALL_TIMEOUT`], or a test's shorter deadline.
+    stall: Duration,
     /// Names the stream in the failure log.
     stream: &'static str,
 }
@@ -133,26 +143,34 @@ impl ExportSender {
         // waiting for the consumer to release a preceding allocation. Observe
         // closure here too because the baseline cursor is sent after the
         // handler's outer export/closed select has completed.
-        let frame = tokio::select! {
-            biased;
-            () = self.sender.closed() => {
-                return Err(OmniError::Io(io::Error::other("served export response closed")));
-            }
-            frame = Arc::clone(&self.lease.frames).acquire_owned() => {
-                frame.map_err(|_| OmniError::manifest_internal("served export frame credits closed"))?
-            }
+        let send = async {
+            let frame = tokio::select! {
+                biased;
+                () = self.sender.closed() => {
+                    return Err(OmniError::Io(io::Error::other("served export response closed")));
+                }
+                frame = Arc::clone(&self.lease.frames).acquire_owned() => {
+                    frame.map_err(|_| OmniError::manifest_internal("served export frame credits closed"))?
+                }
+            };
+            let bytes = Bytes::from_owner(ExportChunk {
+                chunk,
+                _frame: frame,
+                _lease: Arc::clone(&self.lease),
+            });
+            self.sender
+                .send(ExportFrame::Data(bytes))
+                .await
+                .map_err(|_| OmniError::Io(io::Error::other("served export response closed")))
         };
-        let bytes = Bytes::from_owner(ExportChunk {
-            chunk,
-            _frame: frame,
-            _lease: Arc::clone(&self.lease),
-        });
-        // Queue backpressure has no new deadline. This chunk already holds a
-        // credit, and the handler's close select interrupts a disconnected body.
-        self.sender
-            .send(ExportFrame::Data(bytes))
-            .await
-            .map_err(|_| OmniError::Io(io::Error::other("served export response closed")))
+        // Ordinary backpressure waits, but not without end: a consumer that
+        // takes no frame for the stall deadline ends the stream.
+        timeout(self.stall, send).await.unwrap_or_else(|_elapsed| {
+            Err(OmniError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                SERVED_STREAM_STALLED,
+            )))
+        })
     }
 
     /// The baseline handshake fits one chunk (its cursor is capped at 4 KiB).
@@ -171,6 +189,18 @@ impl ExportSender {
     /// and the log names the failure by its class. A failure after the client
     /// has gone reaches nobody and is not logged.
     pub(crate) async fn finish(&self, cut: ExportCut, failure: Option<OmniError>) {
+        let stalled = matches!(&failure, Some(OmniError::Io(error)) if error.kind() == io::ErrorKind::TimedOut);
+        if stalled {
+            // The client, not the server, ended this stream: a warning, and
+            // no second wait on a queue it has already left full.
+            tracing::warn!(
+                error_kind = "served_stream_stalled",
+                stream = self.stream,
+                "served stream ended: the client stopped reading"
+            );
+            drop(cut);
+            return;
+        }
         let error = failure.map(|failure| {
             if !self.sender.is_closed() {
                 let cause = RedactedCause::of(&failure);
@@ -185,14 +215,57 @@ impl ExportSender {
             }
             io::Error::other(SERVED_STREAM_FAILED)
         });
-        let _ = self
-            .sender
-            .send(ExportFrame::Terminal {
-                cut: Box::new(cut),
-                error,
-            })
-            .await;
+        // The cut rides behind the data so the exclusion lasts until the
+        // client has the whole stream, but the producer can take it back: a
+        // consumer that does not take the terminal frame within the stall
+        // deadline loses the cut, and the body ends with a stall error.
+        let slot = Arc::new(Mutex::new(Some(cut)));
+        let terminal = ExportFrame::Terminal {
+            cut: Arc::clone(&slot),
+            error,
+        };
+        let queued = matches!(
+            timeout(self.stall, self.sender.send(terminal)).await,
+            Ok(Ok(()))
+        );
+        if !queued {
+            drop(locked(&slot).take());
+            return;
+        }
+        // The body drops its receiver once it has yielded the terminal. The
+        // watcher holds the channel and the frame credits only, not the queue
+        // lease. Its deadline restarts whenever the client takes a frame, so a
+        // slow but steady reader keeps the stream to its end.
+        let watched = self.sender.clone();
+        let frames = Arc::clone(&self.lease.frames);
+        let stall = self.stall;
+        let stream = self.stream;
+        tokio::spawn(async move {
+            let mut credits = frames.available_permits();
+            loop {
+                if timeout(stall, watched.closed()).await.is_ok() {
+                    break;
+                }
+                let now = frames.available_permits();
+                if now == credits {
+                    if locked(&slot).take().is_some() {
+                        tracing::warn!(
+                            error_kind = "served_stream_stalled",
+                            stream,
+                            "served stream ended: the client stopped reading"
+                        );
+                    }
+                    break;
+                }
+                credits = now;
+            }
+            drop(locked(&slot).take());
+        });
     }
+}
+
+fn locked(slot: &Mutex<Option<ExportCut>>) -> std::sync::MutexGuard<'_, Option<ExportCut>> {
+    slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 struct ExportChunk {
@@ -230,8 +303,9 @@ enum ExportFrame {
     Data(Bytes),
     Terminal {
         /// The move-only cut stays queued behind every data frame. Dropping a
-        /// disconnected response drops this frame and releases the root slot.
-        cut: Box<ExportCut>,
+        /// disconnected response drops this frame and releases the root slot;
+        /// the producer empties the slot if the frame is not taken in time.
+        cut: Arc<Mutex<Option<ExportCut>>>,
         error: Option<io::Error>,
     },
 }
@@ -250,11 +324,20 @@ pub(crate) fn channel(
     lease: Arc<ExportQueueLease>,
     stream: &'static str,
 ) -> (ExportSender, ExportBodyStream) {
+    channel_with_stall(lease, stream, EXPORT_STALL_TIMEOUT)
+}
+
+fn channel_with_stall(
+    lease: Arc<ExportQueueLease>,
+    stream: &'static str,
+    stall: Duration,
+) -> (ExportSender, ExportBodyStream) {
     let (sender, receiver) = mpsc::channel(EXPORT_QUEUE_CHUNKS);
     (
         ExportSender {
             sender,
             lease: Arc::clone(&lease),
+            stall,
             stream,
         },
         ExportBodyStream {
@@ -276,13 +359,15 @@ impl Stream for ExportBodyStream {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(ExportFrame::Data(bytes))) => Poll::Ready(Some(Ok(bytes))),
             Poll::Ready(Some(ExportFrame::Terminal { cut, error })) => {
-                let cut = *cut;
-                drop(cut);
+                let taken = locked(&cut).take();
+                let delivered_in_time = taken.is_some();
+                drop(taken);
                 self.lease.take();
                 self.done = true;
                 match error {
                     Some(error) => Poll::Ready(Some(Err(error))),
-                    None => Poll::Ready(None),
+                    None if delivered_in_time => Poll::Ready(None),
+                    None => Poll::Ready(Some(Err(io::Error::other(SERVED_STREAM_STALLED)))),
                 }
             }
             Poll::Ready(None) => {
@@ -491,6 +576,71 @@ mod tests {
             error.to_string(),
             "served export producer ended without terminal status"
         );
+        assert!(body.next().await.is_none());
+    }
+
+    /// A consumer that takes no frame for the stall deadline ends the stream:
+    /// the producer's pending send fails instead of waiting for as long as
+    /// the connection stays open.
+    #[tokio::test]
+    async fn a_stalled_consumer_ends_the_producer_at_the_deadline() {
+        let transport = ExportTransport::new(
+            EXPORT_QUEUE_RESERVED_BYTES,
+            EXPORT_QUEUE_RESERVED_BYTES,
+            Duration::from_millis(10),
+        );
+        let stall = Duration::from_millis(50);
+        let (sender, body) =
+            channel_with_stall(transport.reserve().await.unwrap(), "export", stall);
+        for _ in 0..EXPORT_QUEUE_CHUNKS {
+            sender
+                .send_chunk(vec![b'x'; EXPORT_CHUNK_MAX_BYTES])
+                .await
+                .unwrap();
+        }
+        let started = std::time::Instant::now();
+        let error = sender
+            .send_chunk(vec![b'x'; EXPORT_CHUNK_MAX_BYTES])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("stalled"), "{error}");
+        assert!(started.elapsed() >= stall);
+        drop(body);
+    }
+
+    /// A terminal frame the consumer does not take within the stall deadline
+    /// gives its export cut back: the graph's export slot frees, and the body,
+    /// read later, ends in an error instead of a clean end.
+    #[tokio::test]
+    async fn an_untaken_terminal_frame_releases_its_cut_at_the_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            Omnigraph::init(
+                temp.path().to_string_lossy().as_ref(),
+                "node Empty { key: String @key }",
+            )
+            .await
+            .unwrap(),
+        );
+        let transport = ExportTransport::new(
+            EXPORT_QUEUE_RESERVED_BYTES,
+            EXPORT_QUEUE_RESERVED_BYTES,
+            Duration::from_millis(10),
+        );
+        let stall = Duration::from_millis(50);
+        let cut = db.capture_served_export_cut("main", &[]).await.unwrap();
+        let (sender, mut body) =
+            channel_with_stall(transport.reserve().await.unwrap(), "export", stall);
+        sender.finish(cut, None).await;
+        assert!(
+            db.capture_served_export_cut("main", &[]).await.is_err(),
+            "a queued terminal keeps the slot until the deadline"
+        );
+        tokio::time::sleep(stall * 4).await;
+        let retry = db.capture_served_export_cut("main", &[]).await.unwrap();
+        drop(retry);
+        let error = body.next().await.unwrap().unwrap_err();
+        assert_eq!(error.to_string(), SERVED_STREAM_STALLED);
         assert!(body.next().await.is_none());
     }
 
