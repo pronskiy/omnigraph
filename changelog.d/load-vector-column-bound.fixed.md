@@ -1,0 +1,1 @@
+- A JSON load, overwrite included, refuses a type whose vector columns need more than `query_memory_bytes` before allocating them; raise the setting for a larger batch.

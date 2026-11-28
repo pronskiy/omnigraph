@@ -258,6 +258,9 @@ counts once; an update's scan holds both, so rewriting N of them needs 2 × N.
 Keyed loads also bound their parser estimate independently. A strict JSONL
 load retains its projected input check, `strict_input_arrow_bytes`.
 A vector counts its full width (dimension × 4 bytes), present or null: 12 KiB for `Vector(3072)`.
+A JSON load also proves a type's vector columns (rows × dimension × 4 bytes,
+present or null) fit `query_memory_bytes` before it builds them, and refuses a
+larger batch as `query_memory_bytes`, whatever the load mode.
 A CSV load has no whole-statement input check; it applies `write_max_bytes` to each staged-write input instead.
 An overwrite stages the reader's 8,192-row batches, and a batch over the
 allowance refuses as `staged_write_input_bytes`.

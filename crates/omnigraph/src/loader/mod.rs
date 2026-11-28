@@ -1072,6 +1072,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     __dst_nr.sort_by(|a, b| a.0.cmp(&b.0));
     for (type_name, rows) in __dst_nr {
         let node_type = &catalog.node_types[&type_name];
+        preflight_vector_columns(&node_type.arrow_schema, rows.len(), memory.limit())?;
         let batch = build_node_batch(
             node_type,
             &rows,
@@ -1162,6 +1163,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     __dst_er.sort_by(|a, b| a.0.cmp(&b.0));
     for (edge_name, rows) in __dst_er {
         let edge_type = &catalog.edge_types[&edge_name];
+        preflight_vector_columns(&edge_type.arrow_schema, rows.len(), memory.limit())?;
         let batch = build_edge_batch(
             edge_type,
             &rows,
@@ -3161,6 +3163,39 @@ enum JsonConversionMode {
     Strict,
 }
 
+/// Refuse a JSON batch whose fixed-size list (vector) columns would take more
+/// than the load's memory pool (`query_memory_bytes`) before any column is
+/// built. Their builders reserve rows × dimension slots up front, null and
+/// missing values included, so a few input bytes per row could otherwise
+/// allocate any amount; an overwrite, which no keyed-write bound covers, is
+/// the case this closes.
+fn preflight_vector_columns(schema: &arrow_schema::Schema, rows: usize, limit: u64) -> Result<()> {
+    let bytes = schema
+        .fields()
+        .iter()
+        .filter_map(|field| match field.data_type() {
+            DataType::FixedSizeList(item, dim) => Some(
+                u64::try_from(rows)
+                    .ok()
+                    .and_then(|rows| rows.checked_mul(u64::try_from(*dim).ok()?))
+                    .and_then(|values| {
+                        values.checked_mul(item.data_type().primitive_width()? as u64)
+                    })
+                    .unwrap_or(u64::MAX),
+            ),
+            _ => None,
+        })
+        .fold(0_u64, u64::saturating_add);
+    if bytes > limit {
+        return Err(OmniError::resource_limit(
+            "query_memory_bytes",
+            limit,
+            bytes,
+        ));
+    }
+    Ok(())
+}
+
 fn build_column_from_json(
     name: &str,
     data_type: &DataType,
@@ -4773,6 +4808,28 @@ edge WorksAt: Person -> Company
                 } if resource == "strict_input_arrow_bytes"
             ),
             "{strict:?}"
+        );
+
+        // A loader-compatible batch proves its vector columns fit the load's
+        // memory pool before any builder reserves them, summed across columns.
+        let vectors = arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("__id", DataType::Utf8, false),
+            arrow_schema::Field::new("a", pathological_vector.clone(), true),
+            arrow_schema::Field::new("b", pathological_vector.clone(), true),
+        ]);
+        preflight_vector_columns(&vectors, 1, 2 * 4 * (i32::MAX as u64)).unwrap();
+        let refused = preflight_vector_columns(&vectors, 2, 157_286_400)
+            .expect_err("vector columns past the pool must be refused before building");
+        assert!(
+            matches!(
+                refused,
+                OmniError::ResourceLimitExceeded {
+                    ref resource,
+                    limit: 157_286_400,
+                    actual,
+                } if resource == "query_memory_bytes" && actual == 2 * 2 * 4 * (i32::MAX as u64)
+            ),
+            "{refused:?}"
         );
 
         let list_schema = arrow_schema::Schema::new(vec![

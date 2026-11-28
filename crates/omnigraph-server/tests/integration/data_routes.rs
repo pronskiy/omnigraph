@@ -1785,6 +1785,88 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     );
 }
 
+/// A served load reserves a vector column's child buffer (rows × dim × 4
+/// bytes) only after proving it fits the load's memory pool. A minimal record
+/// per row (`{"type":"Doc"}`, about 16 bytes) would otherwise make a 32 MiB
+/// body reserve gigabytes for a `Vector(1536)` column before any later budget
+/// saw the batch. Both load routes refuse such an overwrite as a resource
+/// limit, with no effects, and leave the head where it was; a batch that fits
+/// loads. Before the fix the JSON envelope route built the column unchecked
+/// and loaded the batch.
+#[tokio::test(flavor = "multi_thread")]
+async fn overwrite_load_bounds_vector_column_before_building_it() {
+    let temp =
+        init_graph_with_schema("node Doc {\n    title: String?\n    embedding: Vector(1536)?\n}\n")
+            .await;
+    let graph = graph_path(temp.path());
+    let app = build_app(
+        AppState::open(graph.to_string_lossy().to_string())
+            .await
+            .unwrap(),
+    );
+    let rows = |n: usize| "{\"type\":\"Doc\"}\n".repeat(n);
+    let ndjson = |data: String| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/load/ndjson?branch=main&mode=overwrite"))
+            .method(Method::POST)
+            .header("content-type", "application/x-ndjson")
+            .body(Body::from(data))
+            .unwrap()
+    };
+
+    // 1,000 rows × 1,536 × 4 bytes = 6 MiB fits the default 150 MiB pool.
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/load",
+            &json!({"branch": "main", "mode": "overwrite", "data": rows(1_000)}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let head = main_head_commit_id(&app).await;
+
+    // 30,000 rows need 184 MB of vector slots, past the default 150 MiB pool,
+    // from a 480 KB body. The JSON envelope route converts rows the
+    // loader-compatible way and now proves the columns before building them;
+    // the NDJSON route's strict projection already did, under its own
+    // resource name.
+    for (request, resource) in [
+        (
+            json_post(
+                "/load",
+                &json!({"branch": "main", "mode": "overwrite", "data": rows(30_000)}),
+            ),
+            "query_memory_bytes",
+        ),
+        (ndjson(rows(30_000)), "strict_input_arrow_bytes"),
+    ] {
+        let path = request.uri().path().to_string();
+        let (status, body) = json_response(&app, request).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{path}: {body}");
+        assert_eq!(
+            body["resource_limit"]["resource"], resource,
+            "{path}: {body}"
+        );
+        assert_eq!(body["disposition"]["effects"], "none", "{path}: {body}");
+    }
+    let (_, body) = json_response(
+        &app,
+        json_post(
+            "/load",
+            &json!({"branch": "main", "mode": "overwrite", "data": rows(30_000)}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        body["resource_limit"]["actual"],
+        30_000_u64 * 1_536 * 4,
+        "{body}"
+    );
+    assert_eq!(main_head_commit_id(&app).await, head);
+}
+
 /// A load the engine refuses before its first effect answers a plain code,
 /// with no typed details: a malformed or unknown row, a missing key or a
 /// missing endpoint. Nothing ran, so on either load route the

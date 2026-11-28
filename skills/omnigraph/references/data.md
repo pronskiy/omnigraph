@@ -42,7 +42,9 @@ edits.
 > ids than that is refused and cannot be split. The strict NDJSON
 > input path also limits its request body and decoded Arrow memory to 32 MiB,
 > including `overwrite`; ordinary streamed overwrite can exceed the keyed
-> envelope. Check the selected transport's limits before splitting an import.
+> envelope, but a JSON load's vector columns (rows × dimension × 4 bytes for
+> each type) must fit `query_memory_bytes` before they are built. Check the
+> selected transport's limits before splitting an import.
 > Each 32 MiB allowance above, except the HTTP request body, is the
 > `write_max_bytes` setting (default 32 MiB). Raise it for a direct load with
 > `--set write_max_bytes=<bytes>` or `OMNIGRAPH_WRITE_MAX_BYTES`; a served JSONL
