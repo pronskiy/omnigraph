@@ -72,6 +72,7 @@ do not mean there is no possible fix.
 ## Where the fields appear
 
 - **CLI, human formats** (`table`, `kv`, `csv`): the form above on stderr,
+  with control characters in it spelled out,
   then `HTTP 400` when served and the `disposition` line, exit status 1, with no
   colour codes and no backtrace footer.
 - **CLI, machine formats**: `--json` and `--format json` print the API's error

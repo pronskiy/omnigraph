@@ -17,7 +17,12 @@ fn main() -> Result<std::process::ExitCode> {
         Err(error) => {
             // Reported as returning it from `main` would, but with the exit
             // its outcome chose rather than 1, which says nothing changed.
-            let _ = writeln!(std::io::stderr(), "Error: {error:?}");
+            let report = format!("{error:?}");
+            let _ = writeln!(
+                std::io::stderr(),
+                "Error: {}",
+                omnigraph_cli::terminal_safe_lines(&report)
+            );
             omnigraph_cli::app::exit_code(&error)
         }
     };

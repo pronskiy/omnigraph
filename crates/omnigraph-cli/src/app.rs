@@ -266,7 +266,11 @@ fn finish(
                         Some(diagnostic) => render_diagnostic(&failure.output, diagnostic),
                         None => failure.output.error.clone(),
                     };
-                    writeln!(stderr, "{message}")?;
+                    writeln!(
+                        stderr,
+                        "{}",
+                        crate::read_format::terminal_safe_lines(&message)
+                    )?;
                     if let Some(missing) = &failure.missing_credential {
                         writeln!(stderr, "{missing}")?;
                     }
@@ -311,11 +315,20 @@ fn finish(
             }
             None => match &output.diagnostic {
                 Some(diagnostic) => {
-                    writeln!(stderr, "{}", render_diagnostic(&output, diagnostic))?;
+                    let rendered = render_diagnostic(&output, diagnostic);
+                    writeln!(
+                        stderr,
+                        "{}",
+                        crate::read_format::terminal_safe_lines(&rendered)
+                    )?;
                     stderr.flush()?;
                 }
                 None if actor_refused => {
-                    writeln!(stderr, "{}", output.error)?;
+                    writeln!(
+                        stderr,
+                        "{}",
+                        crate::read_format::terminal_safe_lines(&output.error)
+                    )?;
                     stderr.flush()?;
                 }
                 None => return Err(error),

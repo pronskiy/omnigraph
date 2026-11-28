@@ -166,8 +166,8 @@ fn render_kv(output: &ReadOutput) -> Result<String> {
         for column in &columns {
             lines.push(format!(
                 "{}: {}",
-                column,
-                stringify_value(row.get(column).unwrap_or(&Value::Null))
+                terminal_safe(column),
+                terminal_safe(&stringify_value(row.get(column).unwrap_or(&Value::Null)))
             ));
         }
     }
@@ -187,7 +187,7 @@ fn render_table(output: &ReadOutput, options: &ReadRenderOptions) -> Result<Stri
     let widths = columns
         .iter()
         .map(|column| {
-            let mut width = column.chars().count();
+            let mut width = terminal_safe(column).chars().count();
             for row in &rows {
                 let rendered =
                     normalize_cell(&stringify_value(row.get(column).unwrap_or(&Value::Null)));
@@ -244,7 +244,7 @@ fn render_table_line(columns: &[String], widths: &[usize]) -> String {
     columns
         .iter()
         .zip(widths.iter())
-        .map(|(column, width)| pad_to_width(column, *width))
+        .map(|(column, width)| pad_to_width(&terminal_safe(column), *width))
         .collect::<Vec<_>>()
         .join(" | ")
 }
@@ -333,7 +333,56 @@ fn stringify_value(value: &Value) -> String {
 }
 
 fn normalize_cell(value: &str) -> String {
-    value.replace('\n', "\\n")
+    terminal_safe(value).into_owned()
+}
+
+/// Graph text as a human renderer writes it to a terminal: every control
+/// character (C0, DEL and C1) is spelled out, `\n`, `\r` and `\t` by their
+/// escapes and the rest as `\u{..}`, so a stored value can never move the
+/// cursor, erase or overwrite a line, or start an escape sequence on the
+/// reader's terminal. Machine formats (JSON, JSONL, TOON, CSV, Arrow) keep the
+/// exact characters.
+pub(crate) fn terminal_safe(value: &str) -> std::borrow::Cow<'_, str> {
+    escape_for_terminal(value, false)
+}
+
+/// [`terminal_safe`] for multi-line text the CLI itself lays out, an error
+/// or diagnostic on stderr: its line breaks stay, every other control
+/// character is spelled out.
+pub fn terminal_safe_lines(value: &str) -> std::borrow::Cow<'_, str> {
+    escape_for_terminal(value, true)
+}
+
+/// Characters a terminal acts on rather than shows: C0, DEL and C1 controls
+/// (`char::is_control`), and the Unicode direction marks and embeddings that
+/// reorder what follows them on screen.
+fn acts_on_terminal(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+fn escape_for_terminal(value: &str, keep_newlines: bool) -> std::borrow::Cow<'_, str> {
+    if !value.chars().any(acts_on_terminal) {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    let mut out = String::with_capacity(value.len() + 8);
+    for c in value.chars() {
+        match c {
+            '\n' if keep_newlines => out.push('\n'),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if acts_on_terminal(c) => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 fn split_cell(value: &str, width: usize, layout: TableCellLayout) -> Vec<String> {
@@ -419,6 +468,65 @@ mod tests {
             page: None,
             ranking: None,
         }
+    }
+
+    /// Human formats (table, kv) spell out every control character a stored
+    /// value carries, so the value cannot erase, overwrite or hyperlink text
+    /// on the reader's terminal. Machine formats keep the exact characters:
+    /// JSON and TOON escape them in their own syntax, CSV round-trips the
+    /// bytes for `load csv`.
+    /// Direction marks that reorder a line are spelled out like controls;
+    /// stderr text keeps its line breaks and loses the rest.
+    #[test]
+    fn direction_marks_and_stderr_text_are_terminal_safe() {
+        assert_eq!(
+            terminal_safe("abc\u{202e}def\u{2066}"),
+            "abc\\u{202e}def\\u{2066}"
+        );
+        assert_eq!(terminal_safe("plain"), "plain");
+        assert_eq!(
+            terminal_safe_lines("line one\nid '\u{1b}[2Kx'\r"),
+            "line one\nid '\\u{1b}[2Kx'\\r"
+        );
+    }
+
+    #[test]
+    fn human_formats_spell_out_terminal_controls_and_machine_formats_keep_them() {
+        let hostile = "Alice\u{1b}[2K\rFORGED\u{1b}]8;;https://x.invalid/\u{1b}\\x\u{7}\u{9b}";
+        let rows = serde_json::to_string(&serde_json::json!([{ "name": hostile }])).unwrap();
+        let output = ReadOutput {
+            query_name: "q".to_string(),
+            target: ReadTargetOutput {
+                branch: Some("main".to_string()),
+                snapshot: None,
+            },
+            row_count: 1,
+            columns: vec!["name".to_string()],
+            rows: serde_json::value::RawValue::from_string(rows).unwrap(),
+            graph_commit_id: None,
+            page: None,
+            ranking: None,
+        };
+        let options = || ReadRenderOptions {
+            max_column_width: 200,
+            cell_layout: TableCellLayout::Truncate,
+        };
+        let spelled =
+            "Alice\\u{1b}[2K\\rFORGED\\u{1b}]8;;https://x.invalid/\\u{1b}\\x\\u{7}\\u{9b}";
+        for format in [ReadOutputFormat::Table, ReadOutputFormat::Kv] {
+            let rendered = render_read(&output, format, &options()).unwrap();
+            assert!(
+                !rendered.contains(['\u{1b}', '\r', '\u{7}', '\u{9b}']),
+                "{format:?}: {rendered:?}"
+            );
+            assert!(rendered.contains(spelled), "{format:?}: {rendered:?}");
+        }
+        let csv = render_read(&output, ReadOutputFormat::Csv, &options()).unwrap();
+        assert!(csv.contains(hostile), "{csv:?}");
+        let json = render_read(&output, ReadOutputFormat::Json, &options()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["rows"][0]["name"], hostile);
+        assert_eq!(terminal_safe("plain text"), "plain text");
     }
 
     #[test]

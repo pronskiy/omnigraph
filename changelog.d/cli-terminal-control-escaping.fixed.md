@@ -1,0 +1,1 @@
+- Human CLI output and errors spell out control characters and direction marks in graph text (`\n`, `\u{1b}`), so a stored value cannot rewrite what the terminal shows.

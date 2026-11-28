@@ -125,7 +125,14 @@ Read output supports `table`, `json`, `jsonl`, `csv`, `kv`, `toon`, and, for
 `--format`, no `--json`, and no `defaults.output`, a read prints a table. `--json` is the
 stable machine-readable form for commands that do not use `--format`. Result
 cells use the [JSON result spelling](../queries/index.md#json-result-spelling);
-`table` and `kv` print strings unquoted. CSV writes a null as an empty field
+`table` and `kv` print strings unquoted, with every control character and
+Unicode direction mark spelled out (`\n`, `\r`, `\t`, the rest as `\u{1b}`), so
+stored text cannot move the cursor, start an escape sequence or reorder a line
+on your terminal; column names, the human `changes`, `diff`, `commit changes`,
+`commit list` and `blob stat` output, actor ids and errors printed to stderr do
+the same (errors keep their line breaks). This human form is a display: a
+stored backslash and an escaped character can look alike, so read exact values
+with `--json` or `--format jsonl`. CSV keeps values as stored. CSV writes a null as an empty field
 and an empty string as `""`, and quotes fields containing a comma, double
 quote, or line break, so [`load csv`](../mutations/index.md#csv-loading)
 reads a null back as null and the string `null` as that string. `load csv`

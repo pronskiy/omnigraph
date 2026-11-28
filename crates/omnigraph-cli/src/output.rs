@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::app::Completion;
+use crate::read_format::terminal_safe;
 use omnigraph_api_types::{BranchListOutput, CommitListOutput};
 
 pub(crate) fn graph_type_subject(type_key: &str) -> String {
@@ -1037,7 +1038,7 @@ pub(crate) fn write_blob_stat_human(output: &BlobStatOutput, writer: &mut dyn Wr
         BlobContentKindOutput::External => {
             writeln!(writer, "kind: external")?;
             if let Some(uri) = output.uri.as_deref() {
-                writeln!(writer, "uri: {uri}")?;
+                writeln!(writer, "uri: {}", terminal_safe(uri))?;
             }
         }
     }
@@ -1096,7 +1097,7 @@ pub(crate) fn write_change_human(output: &ChangeOutput, writer: &mut dyn Write) 
         )?,
     }
     if let Some(actor_id) = &output.actor_id {
-        writeln!(writer, "actor_id: {}", actor_id)?;
+        writeln!(writer, "actor_id: {}", terminal_safe(actor_id))?;
     }
     Ok(())
 }
@@ -1160,7 +1161,7 @@ pub(crate) fn write_commit_list_human(
             commit
                 .actor_id
                 .as_deref()
-                .map(|actor| format!(" actor={}", actor))
+                .map(|actor| format!(" actor={}", terminal_safe(actor)))
                 .unwrap_or_default(),
             commit_kind_suffix(commit),
         )?;
@@ -1221,7 +1222,7 @@ pub(crate) fn write_commit_human(commit: &CommitOutput, writer: &mut dyn Write) 
         )?;
     }
     if let Some(actor_id) = &commit.actor_id {
-        writeln!(writer, "actor_id: {}", actor_id)?;
+        writeln!(writer, "actor_id: {}", terminal_safe(actor_id))?;
     }
     writeln!(writer, "created_at: {}", commit.created_at)?;
     Ok(())
@@ -1240,7 +1241,7 @@ pub(crate) fn write_change_cause_human(
         writeln!(writer, "merged_parent: {}", merged_parent_commit_id)?;
     }
     if let Some(actor_id) = &cause.actor_id {
-        writeln!(writer, "actor: {}", actor_id)?;
+        writeln!(writer, "actor: {}", terminal_safe(actor_id))?;
     }
     writeln!(writer, "authored_at: {}", cause.authored_at)?;
     Ok(())
@@ -1255,8 +1256,8 @@ fn write_entity_change_row(
         "{} {} {} {}",
         change.op.as_str(),
         change.kind.as_str(),
-        change.r#type.name,
-        change.id
+        terminal_safe(&change.r#type.name),
+        terminal_safe(&change.id)
     )?;
     // Edge endpoints (present on edge images only). An endpoint-moving update
     // must show BOTH pairs; `after.or(before)` alone silently hid the old
@@ -1293,11 +1294,19 @@ fn format_endpoint_change(
     after: Option<&omnigraph_api_types::ChangeEndpointsOutput>,
 ) -> Option<String> {
     match (before, after) {
-        (Some(b), Some(a)) if b.from != a.from || b.to != a.to => {
-            Some(format!("{} -> {} => {} -> {}", b.from, b.to, a.from, a.to))
-        }
+        (Some(b), Some(a)) if b.from != a.from || b.to != a.to => Some(format!(
+            "{} -> {} => {} -> {}",
+            terminal_safe(&b.from),
+            terminal_safe(&b.to),
+            terminal_safe(&a.from),
+            terminal_safe(&a.to)
+        )),
         (Some(endpoints), Some(_)) | (Some(endpoints), None) | (None, Some(endpoints)) => {
-            Some(format!("{} -> {}", endpoints.from, endpoints.to))
+            Some(format!(
+                "{} -> {}",
+                terminal_safe(&endpoints.from),
+                terminal_safe(&endpoints.to)
+            ))
         }
         (None, None) => None,
     }
@@ -1310,9 +1319,9 @@ fn format_endpoint_change(
 /// The `--json` output remains the exact, machine-parseable form.
 fn render_change_value(value: &serde_json::Value) -> String {
     match value {
-        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::String(text) => terminal_safe(text).into_owned(),
         serde_json::Value::Null => "<null>".to_string(),
-        other => other.to_string(),
+        other => terminal_safe(&other.to_string()).into_owned(),
     }
 }
 
@@ -1329,7 +1338,12 @@ fn write_change_properties(
 ) -> Result<()> {
     if let Some(map) = properties.as_object() {
         for (key, value) in map {
-            writeln!(writer, "{marker} {key}: {}", render_change_value(value))?;
+            writeln!(
+                writer,
+                "{marker} {}: {}",
+                terminal_safe(key),
+                render_change_value(value)
+            )?;
         }
     }
     Ok(())
@@ -1358,7 +1372,11 @@ fn write_change_property_diff(
             let after_str = after_value
                 .map(render_change_value)
                 .unwrap_or_else(|| ABSENT_PROPERTY.to_string());
-            writeln!(writer, "  {key}: {before_str} -> {after_str}")?;
+            writeln!(
+                writer,
+                "  {}: {before_str} -> {after_str}",
+                terminal_safe(key)
+            )?;
         }
     }
     Ok(())
@@ -2004,6 +2022,36 @@ mod tests {
             super::render_change_value(&serde_json::json!("")),
             super::ABSENT_PROPERTY
         );
+    }
+
+    /// Change, diff and commit-changes rows print graph text a writer chose:
+    /// ids, endpoints, property keys and values. Every control character is
+    /// spelled out, so a stored value cannot erase, overwrite or recolour the
+    /// reader's terminal.
+    #[test]
+    fn human_change_rows_spell_out_terminal_controls() {
+        let hostile = "a\u{1b}[2K\rb\u{7}\u{9b}c";
+        let spelled = "a\\u{1b}[2K\\rb\\u{7}\\u{9b}c";
+        assert_eq!(
+            super::render_change_value(&serde_json::json!(hostile)),
+            spelled
+        );
+        let ends = omnigraph_api_types::ChangeEndpointsOutput {
+            from: hostile.to_string(),
+            to: "plain".to_string(),
+        };
+        assert_eq!(
+            super::format_endpoint_change(Some(&ends), None),
+            Some(format!("{spelled} -> plain"))
+        );
+        let mut properties = serde_json::Map::new();
+        properties.insert(hostile.to_string(), serde_json::json!(hostile));
+        let mut bytes = Vec::new();
+        super::write_change_properties("  +", &serde_json::Value::Object(properties), &mut bytes)
+            .unwrap();
+        let rendered = String::from_utf8(bytes).unwrap();
+        assert_eq!(rendered, format!("  + {spelled}: {spelled}\n"));
+        assert!(!rendered.contains(['\u{1b}', '\r', '\u{7}', '\u{9b}']));
     }
 
     fn assert_human_format(

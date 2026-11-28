@@ -28,6 +28,10 @@ mod operator_routing;
 mod operator_schema;
 mod operator_transport;
 mod read_format;
+/// Terminal-safe rendering of multi-line text, for the binary's last-resort
+/// error report.
+#[doc(hidden)]
+pub use read_format::terminal_safe_lines;
 mod secure_store_error;
 
 mod admission;
