@@ -31,6 +31,7 @@ impl RedactedCause {
             OmniError::FullTextIndexRebuildRequired { .. } => "FullTextIndexRebuildRequired",
             OmniError::FullTextIndexRequired { .. } => "FullTextIndexRequired",
             OmniError::RetryableCommitConflict(_) => "RetryableCommitConflict",
+            OmniError::EmbeddingProviderRateLimited { .. } => "EmbeddingProviderRateLimited",
             OmniError::DataFusion(_) => "DataFusion",
             OmniError::Io(_) => "Io",
             OmniError::Manifest(_) => "Manifest",

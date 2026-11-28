@@ -1,0 +1,1 @@
+- A provider 429 pauses a graph's embedding calls for its `Retry-After`; a text `nearest` is then refused as `429` without calling the provider, where it used to retry four times.

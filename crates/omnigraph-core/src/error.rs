@@ -344,6 +344,11 @@ pub enum OmniError {
     /// Lance conflicts remain `Storage(Precondition)`.
     #[error("retryable storage commit conflict: {0}")]
     RetryableCommitConflict(String),
+    /// The embedding provider refused for its rate limit and the client is
+    /// waiting out the refusal; this call sent nothing. A caller may try
+    /// again after `retry_after_ms`.
+    #[error("embedding provider is rate limited; retry after {retry_after_ms} ms")]
+    EmbeddingProviderRateLimited { retry_after_ms: u64 },
     #[error("query: {0}")]
     DataFusion(String),
     #[error("io: {0}")]
@@ -810,6 +815,7 @@ impl OmniError {
             | Self::PreconditionFailed { .. }
             | Self::BlobWritePreconditionFailed { .. }
             | Self::Policy(_)
+            | Self::EmbeddingProviderRateLimited { .. }
             | Self::AlreadyInitialized { .. }
             | Self::InitializationClaimed { .. } => true,
             Self::Manifest(ManifestError {

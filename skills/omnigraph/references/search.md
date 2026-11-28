@@ -262,7 +262,10 @@ Configure direct/offline use with `OMNIGRAPH_EMBED_PROVIDER`,
 `OMNIGRAPH_EMBED_BASE_URL`, and `OMNIGRAPH_EMBED_MODEL`. Deadline/retry controls
 are `OMNIGRAPH_EMBED_DEADLINE_MS`, `OMNIGRAPH_EMBED_TIMEOUT_MS`,
 `OMNIGRAPH_EMBED_RETRY_ATTEMPTS`, and `OMNIGRAPH_EMBED_RETRY_BACKOFF_MS`;
-`OMNIGRAPH_EMBEDDINGS_MOCK` forces the mock provider.
+`OMNIGRAPH_EMBEDDINGS_MOCK` forces the mock provider. A provider 429 pauses
+the graph's provider calls for its `Retry-After` (at least 1 s); a text
+`nearest` then answers `429 too_many_requests` without calling the provider,
+so back off rather than loop. Bulk `omnigraph embed` waits the pause out.
 
 For a served graph, declare a named provider under `providers.embedding` in
 `cluster.yaml` and bind it with `graphs.<id>.embedding_provider`. API keys must

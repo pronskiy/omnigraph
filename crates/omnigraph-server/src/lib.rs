@@ -534,6 +534,10 @@ pub struct ApiError {
     /// holds unsettled. Such an error reports its unknown outcome but does
     /// not contain the process.
     scoped_unknown: bool,
+    /// The wait a refusal knows, in whole seconds, sent as `Retry-After` in
+    /// place of the constant default. Two bytes keep `ApiError` within its
+    /// size bound; provider waits are capped at 300 s.
+    retry_after_seconds: Option<std::num::NonZeroU16>,
 }
 
 #[derive(Debug)]
@@ -1247,6 +1251,7 @@ impl ApiError {
             compound: false,
             unpublished: false,
             scoped_unknown: false,
+            retry_after_seconds: None,
         }
     }
 
@@ -1976,6 +1981,14 @@ impl ApiError {
             OmniError::RetryableCommitConflict(message) => {
                 Self::conflict(format!("retryable storage commit conflict: {message}"))
             }
+            // The embedding provider is refusing for rate; nothing was sent.
+            err @ OmniError::EmbeddingProviderRateLimited { retry_after_ms } => {
+                let mut refused = Self::too_many_requests(err.to_string());
+                refused.retry_after_seconds = std::num::NonZeroU16::new(
+                    u16::try_from(retry_after_ms.div_ceil(1_000).max(1)).unwrap_or(u16::MAX),
+                );
+                refused
+            }
             OmniError::Io(err) => Self::internal(format!("io: {err}")),
             // Engine-layer policy enforcement (MR-722). Authentication
             // middleware has already distinguished a missing/invalid bearer
@@ -2092,6 +2105,7 @@ impl IntoResponse for ApiError {
         // The answered code fixes the status: a write the server could not
         // settle answers 500 whatever failed underneath.
         let status = error.status();
+        let retry_after = error.retry_after_seconds;
         let mut headers = axum::http::HeaderMap::new();
         if let Some(ApiErrorDetails::BlobPreconditionFailure(failure)) = error.details.as_deref()
             && let Some(etag) = failure
@@ -2118,7 +2132,10 @@ impl IntoResponse for ApiError {
         {
             headers.insert(
                 axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
+                match retry_after {
+                    Some(seconds) => axum::http::HeaderValue::from(seconds.get()),
+                    None => axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
+                },
             );
         }
         let mut response = (status, headers, Json(output)).into_response();
@@ -2653,6 +2670,16 @@ mod api_error_tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorCode::ServiceUnavailable,
                 retry.clone(),
+            ),
+            // A provider refusing for rate is the server over its load, and
+            // says how long the provider asked for, in whole seconds.
+            (
+                ApiError::from_omni(OmniError::EmbeddingProviderRateLimited {
+                    retry_after_ms: 1_200,
+                }),
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::TooManyRequests,
+                Some("2".to_string()),
             ),
             (
                 ApiError::new(ErrorCode::GraphUnavailable, "graph is loading"),

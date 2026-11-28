@@ -31,6 +31,18 @@ For direct or embedded use, configure the provider with environment variables:
 | `OMNIGRAPH_EMBED_RETRY_BACKOFF_MS` | Initial retry backoff; default 200 ms |
 | `OMNIGRAPH_EMBEDDINGS_MOCK` | Force the mock provider |
 
+A timeout, a connection error or a 5xx is retried with jittered exponential
+backoff inside the deadline. A rate refusal (429) pauses the client: no call on
+that graph's provider binding is sent until the refusal's `Retry-After` (whole
+seconds, capped at 300 s) has passed, and never sooner than 1 s. A text
+`nearest` retries a 429 once, and only when the provider named a
+`Retry-After`; otherwise, and during the pause, it is refused at once with
+`429 too_many_requests`, sending nothing. `omnigraph embed` waits out the
+pause and continues within its attempts. A wait longer than what remains of the
+deadline is refused at once. The pause belongs to one client, a served graph's
+provider binding or one `omnigraph embed` run: two graphs sharing a key pause
+separately, and a deployment that rebinds the provider starts a new one.
+
 The default OpenRouter model is `openai/text-embedding-3-large`. The direct
 OpenAI default is `text-embedding-3-large`; Gemini defaults to
 `gemini-embedding-2`.

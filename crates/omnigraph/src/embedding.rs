@@ -18,6 +18,12 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_RETRY_ATTEMPTS: usize = 4;
 const DEFAULT_RETRY_BACKOFF_MS: u64 = 200;
 const DEFAULT_DEADLINE_MS: u64 = 60_000;
+/// The shortest time a client waits after a 429 before it calls the provider
+/// again, whatever `Retry-After` said (including none, or `0`).
+const RATE_LIMIT_COOLDOWN_FLOOR: Duration = Duration::from_secs(1);
+/// The longest `Retry-After` a client honours; a longer one is capped (the
+/// call's own deadline still bounds every wait).
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
 const GEMINI_QUERY_TASK_TYPE: &str = "RETRIEVAL_QUERY";
 const GEMINI_DOCUMENT_TASK_TYPE: &str = "RETRIEVAL_DOCUMENT";
 
@@ -181,11 +187,22 @@ pub struct EmbeddingClient {
     /// Total wall-clock budget for one embed call, across all retries
     /// (`OMNIGRAPH_EMBED_DEADLINE_MS`). `0` = unbounded.
     deadline_ms: u64,
+    /// End of the cooldown a provider rate refusal (429) started, shared by
+    /// every clone of this client.
+    rate_limited_until: std::sync::Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
 }
 
+#[derive(Default)]
 struct EmbedCallError {
     message: String,
+    /// A transient failure (timeout, connect error, 5xx): retried with
+    /// jittered exponential backoff inside the deadline.
     retryable: bool,
+    /// The provider refused for rate (429). Never retried blind: only after
+    /// the provider's own `Retry-After`, and it starts a client-wide cooldown
+    /// that every concurrent and later call on this client honours.
+    rate_limited: bool,
+    retry_after: Option<Duration>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,6 +272,7 @@ impl EmbeddingClient {
             retry_attempts,
             retry_backoff_ms,
             deadline_ms,
+            rate_limited_until: Default::default(),
         })
     }
 
@@ -353,27 +371,77 @@ impl EmbeddingClient {
         match self.config.provider {
             Provider::Mock => Ok(mock_embedding(input, expected_dim)),
             Provider::Gemini => {
-                self.with_retry(|| self.embed_gemini_once(input, expected_dim, role))
+                self.with_retry(role, || self.embed_gemini_once(input, expected_dim, role))
                     .await
             }
             Provider::OpenAiCompatible => {
-                self.with_retry(|| self.embed_openai_once(input, expected_dim))
+                self.with_retry(role, || self.embed_openai_once(input, expected_dim))
                     .await
             }
         }
     }
 
-    async fn with_retry<T, F, Fut>(&self, mut operation: F) -> Result<T>
+    async fn with_retry<T, F, Fut>(&self, role: EmbedRole, mut operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = std::result::Result<T, EmbedCallError>>,
     {
         let max_attempt = self.retry_attempts.max(1);
+        // A document embedding (`omnigraph embed`, a load's `@embed`) is a
+        // batch the operator started: it waits out a rate refusal and goes on.
+        // A query embedding answers a caller, who is told when to come back.
+        let waits_out = matches!(role, EmbedRole::Document);
+        let deadline = (self.deadline_ms > 0)
+            .then(|| tokio::time::Instant::now() + Duration::from_millis(self.deadline_ms));
+        let fits = |wait: Duration| {
+            deadline.is_none_or(|deadline| tokio::time::Instant::now() + wait < deadline)
+        };
         let mut attempt = 0usize;
+        let mut rate_retried = false;
         loop {
+            // A provider that refused for rate is not asked again before the
+            // time it named (or the cooldown floor): no call on this client
+            // adds load to a provider that is refusing.
+            if let Some(wait) = self.rate_limit_remaining() {
+                if waits_out && fits(wait) {
+                    sleep(wait).await;
+                    continue;
+                }
+                return Err(rate_limited(wait));
+            }
             attempt += 1;
             match operation().await {
                 Ok(value) => return Ok(value),
+                Err(err) if err.rate_limited => {
+                    let cooldown = err
+                        .retry_after
+                        .unwrap_or_default()
+                        .max(RATE_LIMIT_COOLDOWN_FLOOR);
+                    self.start_rate_limit_cooldown(cooldown);
+                    // A query retries a rate refusal once, only when the
+                    // provider said when; a document waits within its attempts.
+                    let may_wait = if waits_out {
+                        attempt < max_attempt
+                    } else {
+                        err.retry_after.is_some() && !rate_retried && attempt < max_attempt
+                    };
+                    // Callers refused together do not come back together.
+                    let spread = Duration::from_millis(jittered(cooldown.as_millis() as u64 / 4));
+                    if !may_wait || !fits(cooldown + spread) {
+                        return Err(rate_limited(cooldown));
+                    }
+                    rate_retried = true;
+                    tracing::warn!(
+                        target: "omnigraph::embedding",
+                        provider = ?self.config.provider,
+                        model = %self.config.model,
+                        attempt,
+                        retry_after_ms = cooldown.as_millis() as u64,
+                        error = %err.message,
+                        "embedding rate limited, waiting out the refusal"
+                    );
+                    sleep(cooldown + spread).await;
+                }
                 Err(err) => {
                     if !err.retryable || attempt >= max_attempt {
                         return Err(OmniError::manifest_internal(err.message));
@@ -387,10 +455,33 @@ impl EmbeddingClient {
                         "embedding attempt failed, retrying"
                     );
                     let shift = (attempt - 1).min(10) as u32;
-                    let delay = self.retry_backoff_ms.saturating_mul(1u64 << shift);
-                    sleep(Duration::from_millis(delay)).await;
+                    let ceiling = self.retry_backoff_ms.saturating_mul(1u64 << shift);
+                    sleep(Duration::from_millis(jittered(ceiling))).await;
                 }
             }
+        }
+    }
+
+    /// Time left before this client may call its provider again, if a rate
+    /// refusal started a cooldown that has not ended.
+    fn rate_limit_remaining(&self) -> Option<Duration> {
+        let until = (*self
+            .rate_limited_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()))?;
+        until
+            .checked_duration_since(tokio::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+    }
+
+    fn start_rate_limit_cooldown(&self, cooldown: Duration) {
+        let until = tokio::time::Instant::now() + cooldown;
+        let mut slot = self
+            .rate_limited_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if slot.is_none_or(|current| current < until) {
+            *slot = Some(until);
         }
     }
 
@@ -424,11 +515,13 @@ impl EmbeddingClient {
                 return Err(EmbedCallError {
                     message: format!("embedding request failed: {}", err),
                     retryable,
+                    ..Default::default()
                 });
             }
         };
 
         let status = response.status();
+        let retry_after = retry_after_header(response.headers());
         let body = match response.text().await {
             Ok(body) => body,
             Err(err) => {
@@ -437,7 +530,9 @@ impl EmbeddingClient {
                         "embedding response read failed (status {}): {}",
                         status, err
                     ),
-                    retryable: status.is_server_error() || status.as_u16() == 429,
+                    retryable: status.is_server_error(),
+                    rate_limited: status.as_u16() == 429,
+                    retry_after,
                 });
             }
         };
@@ -449,7 +544,9 @@ impl EmbeddingClient {
                     "embedding request failed with status {}: {}",
                     status, message
                 ),
-                retryable: status.is_server_error() || status.as_u16() == 429,
+                retryable: status.is_server_error(),
+                rate_limited: status.as_u16() == 429,
+                retry_after,
             });
         }
 
@@ -457,12 +554,14 @@ impl EmbeddingClient {
             serde_json::from_str(&body).map_err(|err| EmbedCallError {
                 message: format!("embedding response decode failed: {}", err),
                 retryable: false,
+                ..Default::default()
             })?;
 
         validate_and_normalize_embedding(parsed.embedding.values, expected_dim).map_err(|message| {
             EmbedCallError {
                 message,
                 retryable: false,
+                ..Default::default()
             }
         })
     }
@@ -490,11 +589,13 @@ impl EmbeddingClient {
                 return Err(EmbedCallError {
                     message: format!("embedding request failed: {}", err),
                     retryable,
+                    ..Default::default()
                 });
             }
         };
 
         let status = response.status();
+        let retry_after = retry_after_header(response.headers());
         let body = match response.text().await {
             Ok(body) => body,
             Err(err) => {
@@ -503,7 +604,9 @@ impl EmbeddingClient {
                         "embedding response read failed (status {}): {}",
                         status, err
                     ),
-                    retryable: status.is_server_error() || status.as_u16() == 429,
+                    retryable: status.is_server_error(),
+                    rate_limited: status.as_u16() == 429,
+                    retry_after,
                 });
             }
         };
@@ -515,7 +618,9 @@ impl EmbeddingClient {
                     "embedding request failed with status {}: {}",
                     status, message
                 ),
-                retryable: status.is_server_error() || status.as_u16() == 429,
+                retryable: status.is_server_error(),
+                rate_limited: status.as_u16() == 429,
+                retry_after,
             });
         }
 
@@ -523,6 +628,7 @@ impl EmbeddingClient {
             serde_json::from_str(&body).map_err(|err| EmbedCallError {
                 message: format!("embedding response decode failed: {}", err),
                 retryable: false,
+                ..Default::default()
             })?;
 
         // The query path embeds exactly one string, so expect one datum at index 0.
@@ -533,15 +639,54 @@ impl EmbeddingClient {
             .ok_or_else(|| EmbedCallError {
                 message: "embedding response missing data[0]".to_string(),
                 retryable: false,
+                ..Default::default()
             })?;
 
         validate_and_normalize_embedding(datum.embedding, expected_dim).map_err(|message| {
             EmbedCallError {
                 message,
                 retryable: false,
+                ..Default::default()
             }
         })
     }
+}
+
+/// The typed refusal of a call made while the provider refuses for rate:
+/// nothing was sent, and the caller is told when to try again.
+fn rate_limited(wait: Duration) -> OmniError {
+    OmniError::EmbeddingProviderRateLimited {
+        retry_after_ms: u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1),
+    }
+}
+
+/// A `Retry-After` given in seconds. The HTTP-date form is not honoured: the
+/// call then gets the default cooldown and is not retried.
+fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let seconds: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(seconds).min(MAX_RETRY_AFTER))
+}
+
+/// Equal jitter: half the ceiling plus a random share of the other half, so
+/// clients that failed together do not retry together.
+fn jittered(ceiling_ms: u64) -> u64 {
+    if ceiling_ms < 2 {
+        return ceiling_ms;
+    }
+    let half = ceiling_ms / 2;
+    // A process-random hasher seeded per call: no clock correlation between
+    // callers that failed together.
+    let entropy = {
+        use std::hash::BuildHasher;
+        std::collections::hash_map::RandomState::new().hash_one(std::time::Instant::now())
+    };
+    half + entropy % (half + 1)
 }
 
 fn gemini_endpoint(base_url: &str, model: &str) -> String {
@@ -763,6 +908,151 @@ mod tests {
 
     use super::*;
 
+    /// A loopback provider that answers every request with the given status
+    /// and headers in turn (the last one repeats) and counts the requests.
+    async fn provider_stub(answers: Vec<(u16, &'static str)>) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                let (status, headers) = answers[n.min(answers.len() - 1)];
+                let mut buf = vec![0u8; 16 * 1024];
+                let _ = socket.read(&mut buf).await;
+                let body = if status == 200 {
+                    r#"{"data":[{"index":0,"embedding":[0.6,0.8]}]}"#
+                } else {
+                    r#"{"error":{"message":"slow down"}}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (base, calls)
+    }
+
+    fn stub_client(base: String) -> EmbeddingClient {
+        let mut client = EmbeddingClient::new(
+            EmbeddingConfig::from_parts(
+                Some("openai-compatible"),
+                Some(base),
+                Some("stub".to_string()),
+                "dummy".to_string(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        client.retry_attempts = 4;
+        client.retry_backoff_ms = 1;
+        client
+    }
+
+    /// A query's 429 with no `Retry-After` is not retried, and the cooldown
+    /// it starts makes the next call on the same client a typed refusal sent
+    /// without a request: a rate refusal is never multiplied by the retry loop
+    /// or by concurrent callers.
+    #[tokio::test]
+    async fn rate_refusal_without_retry_after_is_not_retried_and_cools_down() {
+        let (base, calls) = provider_stub(vec![(429, "")]).await;
+        let client = stub_client(base);
+        for _ in 0..2 {
+            let refused = client.embed_query_text("q", 2).await.unwrap_err();
+            assert!(
+                matches!(refused, OmniError::EmbeddingProviderRateLimited { retry_after_ms } if retry_after_ms >= 1),
+                "{refused:?}"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "the cooldown sent no request"
+            );
+        }
+    }
+
+    /// A query retries a 429 that names `Retry-After` once, after at least the
+    /// one-second floor (`Retry-After: 0` included), and a transient 5xx is
+    /// still retried with backoff. A second 429 is not retried again.
+    #[tokio::test]
+    async fn query_retries_a_named_rate_refusal_once() {
+        let (base, calls) =
+            provider_stub(vec![(429, "retry-after: 0\r\n"), (503, ""), (200, "")]).await;
+        let client = stub_client(base);
+        let started = std::time::Instant::now();
+        let vector = client.embed_query_text("q", 2).await.unwrap();
+        assert_eq!(vector.len(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(started.elapsed() >= RATE_LIMIT_COOLDOWN_FLOOR);
+
+        let (base, calls) = provider_stub(vec![
+            (429, "retry-after: 1\r\n"),
+            (429, "retry-after: 1\r\n"),
+        ])
+        .await;
+        let client = stub_client(base);
+        let refused = client.embed_query_text("q", 2).await.unwrap_err();
+        assert!(
+            matches!(refused, OmniError::EmbeddingProviderRateLimited { .. }),
+            "{refused:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A document embedding, a batch the operator started, waits out a rate
+    /// refusal with no `Retry-After` and goes on.
+    #[tokio::test]
+    async fn document_embedding_waits_out_a_rate_refusal() {
+        let (base, calls) = provider_stub(vec![(429, ""), (200, "")]).await;
+        let client = stub_client(base);
+        let vector = client.embed_document_text("d", 2).await.unwrap();
+        assert_eq!(vector.len(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A wait longer than what is left of the call's deadline is refused at
+    /// once, never slept into the deadline.
+    #[tokio::test]
+    async fn a_wait_past_the_deadline_is_refused_at_once() {
+        let (base, calls) = provider_stub(vec![(429, "retry-after: 120\r\n")]).await;
+        let mut client = stub_client(base);
+        client.deadline_ms = 5_000;
+        let started = std::time::Instant::now();
+        let refused = client.embed_document_text("d", 2).await.unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                OmniError::EmbeddingProviderRateLimited {
+                    retry_after_ms: 120_000
+                }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn retry_after_is_whole_seconds_capped_at_five_minutes() {
+        let header = |value: &str| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::RETRY_AFTER, value.parse().unwrap());
+            retry_after_header(&headers)
+        };
+        assert_eq!(header("5"), Some(Duration::from_secs(5)));
+        assert_eq!(header(" 7 "), Some(Duration::from_secs(7)));
+        assert_eq!(header("86400"), Some(MAX_RETRY_AFTER));
+        assert_eq!(header("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(header("-1"), None);
+    }
+
     struct EnvGuard {
         saved: Vec<(&'static str, Option<String>)>,
     }
@@ -892,7 +1182,7 @@ mod tests {
         let attempts_for_call = Arc::clone(&attempts);
 
         let value = client
-            .with_retry(|| {
+            .with_retry(EmbedRole::Query, || {
                 let attempts_for_call = Arc::clone(&attempts_for_call);
                 async move {
                     let attempt = attempts_for_call.fetch_add(1, Ordering::SeqCst);
@@ -900,6 +1190,7 @@ mod tests {
                         Err(EmbedCallError {
                             message: "retry me".to_string(),
                             retryable: true,
+                            ..Default::default()
                         })
                     } else {
                         Ok("ok")
@@ -917,10 +1208,11 @@ mod tests {
     async fn with_retry_stops_on_non_retryable_failures() {
         let client = EmbeddingClient::mock_for_tests();
         let err = client
-            .with_retry(|| async {
+            .with_retry(EmbedRole::Query, || async {
                 Err::<(), _>(EmbedCallError {
                     message: "do not retry".to_string(),
                     retryable: false,
+                    ..Default::default()
                 })
             })
             .await
