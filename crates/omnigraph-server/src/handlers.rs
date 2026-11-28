@@ -877,6 +877,28 @@ pub(crate) fn authorize_request(
     }
 }
 
+/// Whether the caller may read `source`, the branch an operation copies into
+/// a branch it writes. A branch create, a merge and a load that forks a
+/// missing branch each make the source's content readable on their target,
+/// so each needs `read` on the source as well as its own action: without it
+/// a caller denied `read` on a branch could copy the branch somewhere it may
+/// read.
+fn authorize_source_read(
+    actor: Option<&AuthenticatedActor>,
+    policy: Option<&PolicyEngine>,
+    source: &str,
+) -> std::result::Result<Authz, ApiError> {
+    authorize(
+        actor,
+        policy,
+        PolicyRequest {
+            action: PolicyAction::Read,
+            branch: Some(source.to_string()),
+            target_branch: None,
+        },
+    )
+}
+
 #[utoipa::path(
     get,
     path = "/snapshot",
@@ -1016,12 +1038,26 @@ pub(crate) fn access_body(
         query.branch,
         query.target_branch,
         |access, branch, target_branch| {
+            let action: PolicyAction = access.into();
             let request = PolicyRequest {
-                action: access.into(),
+                action,
                 branch: branch.map(str::to_string),
                 target_branch: target_branch.map(str::to_string),
             };
-            Ok(matches!(authorize(actor, policy, request)?, Authz::Allowed))
+            if !matches!(authorize(actor, policy, request)?, Authz::Allowed) {
+                return Ok(false);
+            }
+            // A branch create or merge from `branch` copies it, so the route
+            // also needs `read` on it; the report answers as the route does.
+            match (action, branch) {
+                (PolicyAction::BranchCreate | PolicyAction::BranchMerge, Some(source)) => {
+                    Ok(matches!(
+                        authorize_source_read(actor, policy, source)?,
+                        Authz::Allowed
+                    ))
+                }
+                _ => Ok(true),
+            }
         },
     )?;
     output.client_id = actor.and_then(|actor| actor.client_id()).map(str::to_owned);
@@ -2654,15 +2690,22 @@ async fn authorize_load_scope(
                     "branch '{branch}' not found; pass `from` to create it"
                 )));
             }
-            Some(from) => authorize_request(
-                actor,
-                handle.policy.as_deref(),
-                PolicyRequest {
-                    action: PolicyAction::BranchCreate,
-                    branch: Some(from.to_string()),
-                    target_branch: Some(branch.to_string()),
-                },
-            )?,
+            Some(from) => {
+                authorize_request(
+                    actor,
+                    handle.policy.as_deref(),
+                    PolicyRequest {
+                        action: PolicyAction::BranchCreate,
+                        branch: Some(from.to_string()),
+                        target_branch: Some(branch.to_string()),
+                    },
+                )?;
+                if let Authz::Denied(message) =
+                    authorize_source_read(actor, handle.policy.as_deref(), from)?
+                {
+                    return Err(ApiError::forbidden(message));
+                }
+            }
         }
     }
     Ok(())
@@ -3108,15 +3151,18 @@ async fn branch_create_body(
             .await
             .map_err(|error| change_route_commit_lookup_error(error, commit_id.as_str()))?,
     };
-    let decision = authorize(
+    let decision = match authorize(
         actor,
         handle.policy.as_deref(),
         PolicyRequest {
             action: PolicyAction::BranchCreate,
-            branch: Some(source),
+            branch: Some(source.clone()),
             target_branch: Some(name.to_string()),
         },
-    )?;
+    )? {
+        Authz::Allowed => authorize_source_read(actor, handle.policy.as_deref(), &source)?,
+        denied => denied,
+    };
     match (decision, &start) {
         (Authz::Allowed, _) => {}
         (Authz::Denied(message), ReadTarget::Branch(_)) => {
@@ -3530,6 +3576,10 @@ fn admit_branch_merge(
             target_branch: Some(target.to_string()),
         },
     )?;
+    if let Authz::Denied(message) = authorize_source_read(actor, handle.policy.as_deref(), source)?
+    {
+        return Err(ApiError::forbidden(message));
+    }
     // Merge body is small JSON; the heavy work is in the engine but is
     // bounded per-(table, branch) by the writer queue. Small constant
     // estimate suffices for the actor in-flight count.

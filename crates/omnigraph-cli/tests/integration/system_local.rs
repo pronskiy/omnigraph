@@ -24,6 +24,11 @@ rules:
       actors: { group: team }
       actions: [change]
       branch_scope: unprotected
+  - id: admins-read
+    allow:
+      actors: { group: admins }
+      actions: [read]
+      branch_scope: any
   - id: admins-promote
     allow:
       actors: { group: admins }
@@ -1422,7 +1427,7 @@ fn local_cli_change_enforces_engine_layer_policy() {
     // Verify the row landed — proves the write actually committed, not
     // just that enforce returned Ok and silently dropped the work. The read
     // uses the bruno token: POLICY_E2E_YAML grants `read` to the `team`
-    // group (bruno), while admins (ragnor) get write-only rules.
+    // group (bruno); admins (ragnor) read only to copy branches.
     let verify = parse_stdout_json(&output_success(
         cli()
             .envs(server.credential("bruno-tok"))

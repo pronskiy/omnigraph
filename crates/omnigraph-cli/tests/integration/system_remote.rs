@@ -34,6 +34,11 @@ rules:
       actors: { group: team }
       actions: [change]
       branch_scope: unprotected
+  - id: admins-read
+    allow:
+      actors: { group: admins }
+      actions: [read]
+      branch_scope: any
   - id: admins-promote
     allow:
       actors: { group: admins }

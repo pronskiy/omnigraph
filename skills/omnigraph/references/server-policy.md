@@ -180,7 +180,10 @@ of its own. A stored read needs
 `change`. A denied and unknown stored-query name both appear as `404` to a
 caller lacking `invoke_query`. A load with `from` also needs `branch_create`
 for the fork, and a merge with `delete_branch` needs `branch_delete` for the
-cleanup step (a denied deletion leaves the merge successful).
+cleanup step (a denied deletion leaves the merge successful). A branch create,
+a merge and a load with `from` each copy their source, so each also needs
+`read` on the source branch; a side-writer that may not read `main` cannot
+branch from it or merge it.
 
 ## Declare and test policy
 

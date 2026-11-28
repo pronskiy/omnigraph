@@ -2564,6 +2564,157 @@ async fn policy_merge_dry_run_needs_read_and_not_branch_merge() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
+/// A branch create, a merge and a load that forks a missing branch copy their
+/// source's content to a branch the caller writes, so each needs `read` on the
+/// source as well as its own action. An actor that may create, merge and change
+/// unprotected branches but read none of `main` (the side-writer shape) is
+/// refused every copy of `main`, by route and by statement, while copies of a
+/// branch it may read still succeed. A start at a commit of `main` answers the
+/// 404 of an unknown commit, as the `branch_create` denial does.
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_branch_copy_needs_read_on_the_source() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
+    db.branch_create_from(ReadTarget::branch("main"), "scratch")
+        .await
+        .unwrap();
+    drop(db);
+    let head = Omnigraph::open(graph.to_str().unwrap())
+        .await
+        .unwrap()
+        .list_commits(Some("main"))
+        .await
+        .unwrap()
+        .remove(0);
+    let head = serde_json::to_value(omnigraph_server::api::commit_output(&head)).unwrap()
+        ["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(
+        &policy_path,
+        "version: 1\ngroups:\n  agents: [act-agent]\n  admins: [act-ada]\nprotected_branches: [main]\nrules:\n  - id: admin-read\n    allow: {actors: {group: admins}, actions: [read], branch_scope: any}\n  - id: admin-branches\n    allow: {actors: {group: admins}, actions: [branch_create], target_branch_scope: unprotected}\n  - id: agent-read-write\n    allow: {actors: {group: agents}, actions: [read, change], branch_scope: unprotected}\n  - id: agent-branches\n    allow: {actors: {group: agents}, actions: [branch_create, branch_merge], target_branch_scope: unprotected}\n",
+    )
+    .unwrap();
+    let app = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph.to_string_lossy().to_string(),
+            vec![
+                ("act-agent".to_string(), "agent-token".to_string()),
+                ("act-ada".to_string(), "admin-token".to_string()),
+            ],
+            Some(&policy_path),
+        )
+        .await
+        .unwrap(),
+    );
+    let post = |uri: &str, body: Value| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g(uri))
+            .method(Method::POST)
+            .header("authorization", "Bearer agent-token")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let row = r#"{"type":"Person","data":{"name":"copied","age":1}}"#;
+
+    for (what, request) in [
+        (
+            "create from main",
+            post("/branches", json!({"name": "copy_a", "from": "main"})),
+        ),
+        (
+            "create with no from",
+            post("/branches", json!({"name": "copy_b"})),
+        ),
+        (
+            "merge main into scratch",
+            post(
+                "/branches/merge",
+                json!({"source": "main", "target": "scratch"}),
+            ),
+        ),
+        (
+            "load forking main",
+            post(
+                "/load",
+                json!({"branch": "copy_c", "from": "main", "data": row}),
+            ),
+        ),
+        (
+            "statement create",
+            statement_request("/mutate", "agent-token", "branch create copy_d from main"),
+        ),
+        (
+            "statement merge",
+            statement_request("/mutate", "agent-token", "branch merge main into scratch"),
+        ),
+    ] {
+        let (status, body) = json_response(&app, request).await;
+        assert_forbidden(status, body, what);
+    }
+    for request in [
+        post("/branches", json!({"name": "copy_e", "from_commit": head})),
+        statement_request(
+            "/mutate",
+            "agent-token",
+            &format!("branch create copy_f from commit \"{head}\""),
+        ),
+    ] {
+        let (status, body) = json_response(&app, request).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+    // The same commit start is served to an actor that may read main: the
+    // 404 above is the refusal, not an unknown id.
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/branches"))
+            .method(Method::POST)
+            .header("authorization", "Bearer admin-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"name": "copy_admin", "from_commit": head}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let branches = Omnigraph::open(graph.to_str().unwrap())
+        .await
+        .unwrap()
+        .branch_list()
+        .await
+        .unwrap();
+    assert!(
+        !branches
+            .iter()
+            .any(|branch| branch.starts_with("copy_") && branch != "copy_admin"),
+        "a refused copy created no branch: {branches:?}"
+    );
+
+    // Copies of a branch the agent reads go through.
+    for request in [
+        post("/branches", json!({"name": "copy_g", "from": "scratch"})),
+        post(
+            "/load",
+            json!({"branch": "copy_h", "from": "scratch", "data": row}),
+        ),
+        post(
+            "/branches/merge",
+            json!({"source": "copy_g", "target": "scratch"}),
+        ),
+    ] {
+        let (status, body) = json_response(&app, request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+}
+
 /// A branch review's endpoints are the merge base and the source head, which
 /// can both be readable while the target is not; the base and the result
 /// would then reveal whether the target has incorporated the source. So the
@@ -3036,6 +3187,18 @@ rules:
       actors: { group: readers }
       actions: [read]
       branch_scope: any
+  # Branch copies read their source; these rules name branches only, so
+  # the scope-free reads (branch list, show) stay ungranted.
+  - id: admins-read-protected
+    allow:
+      actors: { group: admins }
+      actions: [read]
+      branch_scope: protected
+  - id: admins-read-unprotected
+    allow:
+      actors: { group: admins }
+      actions: [read]
+      branch_scope: unprotected
   - id: admins-branch-control
     allow:
       actors: { group: admins }
@@ -4615,10 +4778,12 @@ rules:
         .await
         .unwrap(),
     );
+    // `branch_create` from main is granted on its target slot but not
+    // reported: a branch create copies main, and this actor may not read it.
     for (query, actions) in [
         (
             "?branch=main&target_branch=feature",
-            json!(["maintain", "schema_apply", "branch_create"]),
+            json!(["maintain", "schema_apply"]),
         ),
         (
             "?branch=feature&target_branch=main",

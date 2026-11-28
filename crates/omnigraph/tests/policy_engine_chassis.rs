@@ -47,17 +47,24 @@ version: 1
 groups:
   writers: [act-allowed]
   readers: [act-denied]
+  copiers: [act-copier]
 protected_branches: [main]
 rules:
   - id: writers-data
     allow:
       actors: { group: writers }
-      actions: [change]
+      actions: [read, change]
       branch_scope: any
   - id: writers-branches-schema
     allow:
       actors: { group: writers }
       actions: [schema_apply, branch_create, branch_delete, branch_merge]
+      target_branch_scope: any
+  # May create and merge branches but read none: every copy is refused.
+  - id: copiers-branches
+    allow:
+      actors: { group: copiers }
+      actions: [branch_create, branch_merge]
       target_branch_scope: any
 "#;
 
@@ -608,6 +615,49 @@ async fn branch_create_from_as_denies_when_policy_rejects_actor() {
         "{result:?}"
     );
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+}
+
+/// A branch create and a merge copy their source, so the engine refuses
+/// them to an actor allowed the branch action but not `read` on the source,
+/// as the server does; a start at a commit answers the not-found of an
+/// unknown id.
+#[tokio::test]
+async fn branch_copy_as_needs_read_on_the_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _engine) = init_with_policy(&dir).await;
+    fn denied_read<T>(result: &Result<T, OmniError>) -> bool {
+        matches!(result, Err(OmniError::Policy(message)) if message.contains("'read'"))
+    }
+
+    let result = db
+        .branch_create_from_as(ReadTarget::branch("main"), "copy", Some("act-copier"))
+        .await;
+    assert!(denied_read(&result), "{result:?}");
+    let result = db.branch_create_as("copy", Some("act-copier")).await;
+    assert!(denied_read(&result), "{result:?}");
+    let head = db.list_commits(Some("main")).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    let result = db
+        .branch_create_from_as(
+            ReadTarget::snapshot(SnapshotId::new(head)),
+            "copy",
+            Some("act-copier"),
+        )
+        .await;
+    assert!(
+        matches!(&result, Err(OmniError::Manifest(error)) if error.kind == ManifestErrorKind::NotFound),
+        "{result:?}"
+    );
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+
+    db.branch_create_from_as(ReadTarget::branch("main"), "feature", Some("act-allowed"))
+        .await
+        .unwrap();
+    let result = db
+        .branch_merge_as("feature", "main", Some("act-copier"))
+        .await;
+    assert!(denied_read(&result), "{result:?}");
 }
 
 #[tokio::test]

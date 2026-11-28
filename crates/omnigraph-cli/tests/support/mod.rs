@@ -1033,7 +1033,7 @@ rules:
   - id: cluster-operators-change
     allow:
       actors: { group: cluster_operators }
-      actions: [change, schema_apply, maintain]
+      actions: [read, change, schema_apply, maintain]
   - id: cluster-operators-branch
     allow:
       actors: { group: cluster_operators }

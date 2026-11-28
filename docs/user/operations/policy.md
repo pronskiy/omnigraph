@@ -166,6 +166,12 @@ branch as the target. A start at a commit (`from_commit`) checks the branch
 that wrote the commit as the source; a denial answers `404`, as an id no
 commit has does, so the id discloses nothing (see
 [start a branch at a commit](../branching/index.md#start-a-branch-at-a-commit)).
+A branch create, a merge and a load with `from` copy their source's content
+to a branch the caller writes, so each also needs `read` on the source
+branch, checked on the same door and answered the same way: `403` for a
+branch, `404` for a commit. An actor allowed to create, merge or change
+unprotected branches but not to read `main` therefore cannot branch from
+`main` or merge it into a branch it reads.
 
 ## Validate and test
 

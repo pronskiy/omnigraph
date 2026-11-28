@@ -1027,7 +1027,7 @@ rules:
   - id: admins-change-anywhere
     allow:
       actors: { group: admins }
-      actions: [change]
+      actions: [read, change]
       branch_scope: any
   - id: admins-merge-to-protected
     allow:

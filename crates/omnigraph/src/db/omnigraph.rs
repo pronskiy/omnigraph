@@ -1194,6 +1194,18 @@ impl Omnigraph {
     /// Before any of these, a branch name in `scope` that is not canonical is
     /// refused as a bad request: the decision judges the name as written, and
     /// the writer then opens that same name.
+    /// A write that copies a branch's content onto a branch its caller
+    /// writes (a branch create, a merge, a load that forks its branch) also
+    /// needs `read` on that source branch. Without it, an actor denied `read`
+    /// on a branch could copy the branch to one it may read.
+    pub(crate) fn enforce_source_read(&self, source: &str, actor: Option<&str>) -> Result<()> {
+        self.enforce(
+            omnigraph_policy::PolicyAction::Read,
+            &omnigraph_policy::ResourceScope::Branch(source.to_string()),
+            actor,
+        )
+    }
+
     pub(crate) fn enforce(
         &self,
         action: omnigraph_policy::PolicyAction,
@@ -4188,13 +4200,14 @@ impl Omnigraph {
             &omnigraph_policy::ResourceScope::TargetBranch(name.to_string()),
             actor,
         )?;
+        let source = self.active_branch().await;
+        self.enforce_source_read(source.as_deref().unwrap_or("main"), actor)?;
         let target = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
         let _export_exclusion = self.reserve_export_destructive_control()?;
         self.ensure_schema_state_valid()
             .await
             .map_err(OmniError::before_effect)?;
-        let source = self.active_branch().await;
         fail(&BRANCH_CONTROL_PRE_GATES).map_err(OmniError::before_effect)?;
         let _schema_permit = self.write_queue().acquire_schema_exclusive().await?;
         let _branch_guards = self
@@ -4276,6 +4289,7 @@ impl Omnigraph {
                     },
                     actor,
                 )?;
+                self.enforce_source_read(&branch, actor)?;
                 CreateStart::Head(branch)
             }
             ReadTarget::Snapshot(id) => {
@@ -4284,7 +4298,11 @@ impl Omnigraph {
                     source: addressed.target_branch().unwrap_or("main").to_string(),
                     target: name.to_string(),
                 };
-                match self.enforce(omnigraph_policy::PolicyAction::BranchCreate, &scope, actor) {
+                let source = addressed.target_branch().unwrap_or("main").to_string();
+                let decision = self
+                    .enforce(omnigraph_policy::PolicyAction::BranchCreate, &scope, actor)
+                    .and_then(|()| self.enforce_source_read(&source, actor));
+                match decision {
                     Err(OmniError::Policy(_)) if actor.is_some() => {
                         return Err(commit_not_found(&id));
                     }

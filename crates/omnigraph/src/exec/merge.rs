@@ -5376,6 +5376,9 @@ impl Session {
             },
             actor_id,
         )?;
+        // A merge copies the source's changes onto the target, so it also
+        // needs `read` on the source (`Omnigraph::enforce_source_read`).
+        self.enforce_source_read(source, actor_id)?;
         // Keep the planning/publication future out of the public API's callers;
         // deeply composed loads and merges otherwise retain large debug
         // construction frames throughout execution. Poll it in the same task.

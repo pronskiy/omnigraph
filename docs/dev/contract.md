@@ -288,7 +288,9 @@ policy. An admitted identity can discover every registered graph's ID and
 display name. Its access report describes the actions its credential may
 perform on a ready graph, including an empty set. The engine checks every
 write against the installed policy before the first lasting effect, so a
-denied write changes nothing. A direct CLI write to a cluster graph uses
+denied write changes nothing. A branch create, a merge and a load that
+creates its branch copy their source, so each write is refused unless its
+caller may also read the source branch. A direct CLI write to a cluster graph uses
 that cluster's policy. Reads through the engine or the
 direct CLI are not checked `D9`, and a direct or embedded caller states its
 own actor. A served graph with no policy denies authenticated graph data
@@ -661,7 +663,7 @@ says so in its contract line.
 | `D6` † | `schema.refuses`, `schema+branch` | Schema apply runs on `main` only, with no other branch live | A schema change made on a branch and merged, under the same review as data? The test would be that each side's schema reads the other's data: additions optional or defaulted, no identity reused |
 | `D7` | `read+schema`, `read+branch`, `read+maintain` | On one server a read can wait behind schema apply, branch create or `schema upgrade-system-columns`. The refusals between an export or `changes baseline` and other kinds hold on one server only; nothing excludes them across servers | Reads never wait or refuse? |
 | `D8` † | `write+schema`, `write+maintain`, `write+reclaim` | Writers wait while schema apply or `cleanup` runs, and writers on `main` wait while `optimize` runs, for a time a run started without the server does not bound | Reads and writes served without pause through maintenance? |
-| `D9` | `E6` | Reads are checked at the server only. Policy scope stops at the branch class. A write needs no permission to read, so a refusal such as `key_conflict` can name an entity on a branch its caller cannot read. A denial is recorded in server logs only | Check reads at every door? Scope by type and property? Require read for a write that can reveal? Record denials where an operator can read them? |
+| `D9` | `E6` | Reads are checked at the server only. Policy scope stops at the branch class. Apart from the copies `E6` names, a write needs no permission to read, so a refusal such as `key_conflict` can name an entity on a branch its caller cannot read. A denial is recorded in server logs only | Check reads at every door? Scope by type and property? Require read for a write that can reveal? Record denials where an operator can read them? |
 | `D10` | `read:1` | Groups that tie on the sort keys come back in no stated order | One total order for every sorted read? |
 | `D11` | `reclaim:4` | `optimize` does not rewrite every file that holds a deleted value | An erasure path? |
 | `D12` | `E4`, Kinds | A stream that fails after its headers ends in a cut-off body. A merge that deletes its source can report success when the delete failed | Every failure typed? |
