@@ -1,0 +1,1 @@
+- A change-feed page now needs `read` on the branch that wrote each commit, so a fork's feed no longer replays its source's earlier commits to a caller who cannot read the source.

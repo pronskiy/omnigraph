@@ -121,7 +121,10 @@ records use the export envelope with top-level `id`, separate from user `data`.
 
 On POSIX, CLI `--out` syncs and atomically replaces the snapshot file before it
 prints the handshake to JSON stdout. Baselines require Cedar `export`; commit
-changes and feed polling require `read`.
+changes and feed polling require `read`. A feed page also needs `read` on the
+branch that wrote each commit in it, so a fork's feed from `beginning` is
+refused to an actor that cannot read the fork's source; start it with
+`after:<fork commit>`.
 
 Canonical contracts: [change feeds](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/branching/changes.md)
 and [conditional mutations](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/mutations/conditional.md).

@@ -399,7 +399,9 @@ the guide has the full rules and this page keeps the promise.
    same commit id, so a consumer that stores the commit id or the cursor
    with its effect applies each commit once. Two branches' feeds have no
    order between them. Reclaimed history, a schema change and a cursor from
-   an earlier branch of the same name are refusals, never silent gaps. A
+   an earlier branch of the same name are refusals, never silent gaps, and so
+   is a page that would deliver a commit written on a branch its caller may
+   not read, such as a fork's source before the fork. A
    change is the net change of its commit against its first parent: the
    entity after an insert, before and after an update, before a delete.
 6. `read:6` Any two commits can be compared, except across a schema change

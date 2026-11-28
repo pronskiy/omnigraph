@@ -2564,6 +2564,121 @@ async fn policy_merge_dry_run_needs_read_and_not_branch_merge() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
+/// A fork's first-parent history holds the commits its source wrote before
+/// the fork. The feed checks each commit on the branch that wrote it, so a
+/// caller who may read the fork but not `main` is refused a page that would
+/// replay `main`'s commits, never served them and never served the page with
+/// them skipped. A feed started after the fork serves the fork's own commits,
+/// and a caller who may read both reads the whole history.
+// contract: read:5
+#[tokio::test(flavor = "multi_thread")]
+async fn change_feed_checks_read_on_the_branch_that_wrote_each_commit() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
+    db.branch_create_from(ReadTarget::branch("main"), "scratch")
+        .await
+        .unwrap();
+    db.load_with_receipt(
+        "scratch",
+        r#"{"type":"Person","data":{"name":"fork-only","age":7}}"#,
+        omnigraph::loader::LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    drop(db);
+    let fork_point = Omnigraph::open(graph.to_str().unwrap())
+        .await
+        .unwrap()
+        .list_commits(Some("main"))
+        .await
+        .unwrap()
+        .remove(0);
+    let fork_point = serde_json::to_value(omnigraph_server::api::commit_output(&fork_point))
+        .unwrap()["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(
+        &policy_path,
+        "version: 1\ngroups:\n  agents: [act-agent]\n  admins: [act-ada]\nprotected_branches: [main]\nrules:\n  - id: agent-read\n    allow: {actors: {group: agents}, actions: [read], branch_scope: unprotected}\n  - id: admin-read\n    allow: {actors: {group: admins}, actions: [read], branch_scope: any}\n",
+    )
+    .unwrap();
+    let app = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph.to_string_lossy().to_string(),
+            vec![
+                ("act-agent".to_string(), "agent-token".to_string()),
+                ("act-ada".to_string(), "admin-token".to_string()),
+            ],
+            Some(&policy_path),
+        )
+        .await
+        .unwrap(),
+    );
+    let get = |uri: String, token: &str| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g(&uri))
+            .method(Method::GET)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let authored = |feed: &Value| -> Vec<String> {
+        feed["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|block| {
+                block["cause"]["authored_branch"]
+                    .as_str()
+                    .unwrap_or("main")
+                    .to_string()
+            })
+            .collect()
+    };
+
+    let (status, body) = json_response(
+        &app,
+        get(
+            "/changes?branch=scratch&start=beginning".into(),
+            "agent-token",
+        ),
+    )
+    .await;
+    assert_forbidden(status, body.clone(), "feed replaying main's commits");
+    assert!(body.to_string().contains("'main'"), "{body}");
+
+    let (status, feed) = json_response(
+        &app,
+        get(
+            format!("/changes?branch=scratch&start=after:{fork_point}"),
+            "agent-token",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{feed}");
+    assert_eq!(authored(&feed), ["scratch"]);
+
+    let (status, feed) = json_response(
+        &app,
+        get(
+            "/changes?branch=scratch&start=beginning".into(),
+            "admin-token",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{feed}");
+    let branches = authored(&feed);
+    assert!(
+        branches.iter().any(|branch| branch == "main"),
+        "{branches:?}"
+    );
+    assert_eq!(branches.last().map(String::as_str), Some("scratch"));
+}
+
 /// A branch review's endpoints are the merge base and the source head, which
 /// can both be readable while the target is not; the base and the result
 /// would then reveal whether the target has incorporated the source. So the

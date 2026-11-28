@@ -5073,6 +5073,36 @@ pub(crate) async fn server_changes_feed(
         .await
         .map_err(change_route_error)?
     };
+    // A branch's first-parent history includes the commits its source wrote
+    // before the fork. Each one is checked on the branch that wrote it: read
+    // on a fork is not read on its source. A page holding a commit the caller
+    // may not read is refused whole, never delivered with it skipped (a feed
+    // never skips a commit), and a start after the fork reads only the fork.
+    let policy = handle.policy.as_deref();
+    let actor = actor.as_ref().map(|Extension(actor)| actor);
+    let mut checked = std::collections::BTreeSet::new();
+    for block in &page.blocks {
+        let authored = block.cause.authored_branch.as_deref().unwrap_or("main");
+        if authored == branch || !checked.insert(authored) {
+            continue;
+        }
+        let decision = authorize(
+            actor,
+            policy,
+            PolicyRequest {
+                action: PolicyAction::Read,
+                branch: Some(authored.to_string()),
+                target_branch: None,
+            },
+        )?;
+        if let Authz::Denied(denied) = decision {
+            return Err(ApiError::forbidden(format!(
+                "the feed of '{branch}' from this position replays commit '{}', written on \
+                 '{authored}' before the fork; start the feed after the fork ({denied})",
+                block.cause.graph_commit_id
+            )));
+        }
+    }
     Ok(Json(api::change_feed_output(&page)))
 }
 

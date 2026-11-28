@@ -213,7 +213,14 @@ resumed feed begins with commits after the captured snapshot.
 
 Baseline kind and type filters select the snapshot contents. An operation
 filter applies only to the resumed feed. Baselines require the `export`
-policy action; commit changes, diffs and feed polling require `read`. A diff
+policy action; commit changes, diffs and feed polling require `read`. A feed
+page also needs `read` on the branch that wrote each commit it delivers: a
+fork's first-parent history holds the commits its source wrote before the
+fork, so a caller who may read the fork but not its source is refused (`403`)
+a page that would replay them, and starts the feed after the fork instead
+(`start=after:<fork commit>`, where the fork commit is the newest commit in the
+branch's `commit list` written on another branch). A cursor saved inside that
+earlier history is refused the same way; install a new baseline. A diff
 needs `read` on the branch each side resolves to; a side the actor cannot read
 answers `404` exactly as a side that names nothing, whatever the other side
 names. The engine reads a commit whose branch was deleted while a live
