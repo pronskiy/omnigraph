@@ -264,6 +264,12 @@ pub trait PlanSource {
         None
     }
 
+    /// The finite allowance for the pairs a cross join forms, the session's
+    /// `traversal_work_limit`; read only by a plan that has a cross join.
+    fn pair_work_limit(&self) -> Option<u64> {
+        None
+    }
+
     /// The session's `ann_nprobes` setting, the probe cap a `nearest` scan
     /// carries; `None` is no cap. The plan records the value it read.
     fn ann_nprobes(&self) -> Option<usize> {

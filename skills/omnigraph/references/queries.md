@@ -109,7 +109,9 @@ Bounds must be finite (`{1,}` is `T15`), and a bound above one needs an edge
 with the same node type at both ends (`$p worksAt{1,2} $c` over
 `Person -> Company` is `T5`). `$a (knows | likes) $b` follows either edge type,
 and `$a *{1,3} $b` any compatible type (declare both endpoint types); both
-share the `traversal_work_limit` setting.
+share the `traversal_work_limit` setting. The same setting caps the pairs a
+match forms between bindings no edge connects (n × n for two bindings of n
+rows), so connect bindings with an edge or raise the limit deliberately.
 
 Hop counts are shortest-path distances from the start node (`{2,2}` returns
 nodes exactly two hops away); a node is not re-reached through a cycle, and

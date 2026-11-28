@@ -130,6 +130,10 @@ pub struct Assumptions {
     /// One shared traversal-work allowance, present for statements using edge selections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traversal_work_limit: Option<u64>,
+    /// The allowance a cross join charges its pairs to, present for plans
+    /// with a cross join.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_work_limit: Option<u64>,
     /// Retained even when rewrites remove an expansion, for historical replay admission.
     #[serde(default, skip_serializing_if = "is_false")]
     pub has_wildcard_traversal: bool,
@@ -179,6 +183,22 @@ impl Assumptions {
                 "wildcard traversal requires a finite traversal_work_limit",
                 Some(SET_TRAVERSAL_WORK_LIMIT),
             )),
+            None => Ok(None),
+        }
+    }
+
+    /// Validate the captured cross join pair allowance before execution.
+    ///
+    /// # Errors
+    /// Returns an error for a limit outside `1..=i64::MAX`.
+    pub fn validated_pair_work_limit(&self) -> Result<Option<NonZeroU64>, PlanError> {
+        match self.pair_work_limit {
+            Some(limit) if limit == 0 || limit > i64::MAX as u64 => Err(PlanError::refused(
+                P003,
+                "pair_work_limit must be in 1..=i64::MAX",
+                Some("set `traversal_work_limit` to a value in 1..=9223372036854775807"),
+            )),
+            Some(limit) => Ok(NonZeroU64::new(limit)),
             None => Ok(None),
         }
     }

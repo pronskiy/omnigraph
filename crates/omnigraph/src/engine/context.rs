@@ -244,6 +244,20 @@ impl QueryContext {
         })
     }
 
+    /// Install the allowance a cross join charges its pairs to (the plan's
+    /// `pair_work_limit`); `None` leaves pairs uncharged.
+    pub(super) fn with_pair_limit(self, limit: Option<NonZeroU64>) -> Self {
+        if let Some(resources) = self
+            .session
+            .state()
+            .config()
+            .get_extension::<QueryResources>()
+        {
+            resources.set_pair_limit(limit);
+        }
+        self
+    }
+
     pub(super) fn task_ctx(&self) -> Arc<TaskContext> {
         self.session.task_ctx()
     }

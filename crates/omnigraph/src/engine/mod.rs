@@ -465,6 +465,13 @@ fn validate_traversal_admission(plan: &PhysicalPlan) -> Result<Option<std::num::
                     ));
                 }
             }
+            PhysicalNode::CrossJoin { .. } | PhysicalNode::ContainsJoin { .. }
+                if plan.assumptions().pair_work_limit.is_none() =>
+            {
+                return Err(OmniError::manifest_internal(
+                    "a cross join plan must carry the pair allowance it charges",
+                ));
+            }
             PhysicalNode::RankFuse { prefilter, .. } if cap.is_some() && prefilter.admits() => {
                 return Err(OmniError::manifest_internal(
                     "budgeted traversal cannot use the CSR prefilter",
@@ -496,8 +503,14 @@ pub(crate) async fn execute(
     let traversal_limit = validate_traversal_admission(&bound.plan)?;
     let ranking = omnigraph_planner::planned_ranking(&bound.plan)
         .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+    let pair_limit = bound
+        .plan
+        .assumptions()
+        .validated_pair_work_limit()
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
     let ctx =
-        QueryContext::with_traversal_limit(bound.plan.assumptions().memory_limit, traversal_limit)?;
+        QueryContext::with_traversal_limit(bound.plan.assumptions().memory_limit, traversal_limit)?
+            .with_pair_limit(pair_limit);
     let (mut run, scans) = ctx
         .run_owned(execute_with_context(bound, evidence, context, &ctx))
         .await?;

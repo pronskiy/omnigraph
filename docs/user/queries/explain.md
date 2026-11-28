@@ -159,7 +159,9 @@ fragment, `partial` when coverage is incomplete or unknown, `absent` without a
 full-text index); and
 `memory_limit`, the query pool in bytes. Selector statements also capture
 `traversal_work_limit`, shared across the execution, and `has_wildcard_traversal`,
-retained through rewrites so historical replay can enforce the target rule. Every
+retained through rewrites so historical replay can enforce the target rule. A
+statement with a cross join captures `pair_work_limit`, the allowance its pairs
+are charged to. Every
 planned document carries `pipelines`, the physical plan cut at each node whose
 operator emits nothing before it has seen its whole input (`Sort`, `Aggregate`,
 `AntiJoin`, `RankFuse`, a load's `Validate`, a costed multi-hop `Expand`) and

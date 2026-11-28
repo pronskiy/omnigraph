@@ -35,6 +35,8 @@ pub(in crate::engine) struct QueryResources {
     buffers: Mutex<BufferRegistry>,
     registry_memory: MemoryReservation,
     traversal: TraversalWork,
+    /// The cross-join pair allowance; set once per query before it runs.
+    pairs: std::sync::OnceLock<TraversalWork>,
     work: QueryWorkScope,
     /// A csv load's shares of this pool, carved per run by `ValidateExec`.
     load_budget: Mutex<Option<Arc<LoadBudget>>>,
@@ -214,9 +216,15 @@ impl QueryResources {
             read_seams: crate::instrumentation::capture_external_read_seams(),
             buffers: Mutex::new(BufferRegistry::default()),
             traversal: TraversalWork::new(traversal_limit),
+            pairs: std::sync::OnceLock::new(),
             work,
             load_budget: Mutex::new(None),
         }
+    }
+
+    /// Install the cross-join pair allowance; a second call is ignored.
+    pub(in crate::engine) fn set_pair_limit(&self, limit: Option<NonZeroU64>) {
+        let _ = self.pairs.set(TraversalWork::new(limit));
     }
 
     fn load_budget(&self) -> Option<Arc<LoadBudget>> {
@@ -674,6 +682,16 @@ impl WorkMemory {
     pub(in crate::engine) fn charge_traversal(&self, additional: u64) -> DfResult<()> {
         self.check()?;
         self.resources.traversal.charge(additional)
+    }
+
+    /// Charge the pairs a cross join is about to form against the query's
+    /// pair allowance (`traversal_work_limit`), refusing past it.
+    pub(in crate::engine) fn charge_pairs(&self, additional: u64) -> DfResult<()> {
+        self.check()?;
+        match self.resources.pairs.get() {
+            Some(pairs) => pairs.charge(additional),
+            None => Ok(()),
+        }
     }
 
     pub(in crate::engine) fn cancel_on_drop(&self) -> CancelOnDrop {

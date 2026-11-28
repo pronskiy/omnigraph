@@ -141,15 +141,19 @@ impl PairBuffer {
     }
 
     /// Each of the left rows `rows` paired with every row of the started
-    /// right batch.
+    /// right batch. All the pairs are charged to the query's pair allowance
+    /// (`traversal_work_limit`) before the first is formed.
     pub(super) async fn push_rows(
         &mut self,
         rows: impl IntoIterator<Item = u32>,
         sender: &BatchSender,
     ) -> DfResult<()> {
+        let rows: Vec<u32> = rows.into_iter().collect();
+        self.charge
+            .charge_pairs((rows.len() as u64).saturating_mul(u64::from(self.right_count)))?;
         for row in rows {
             for right_row in 0..self.right_count {
-                self.push(row, right_row, sender).await?;
+                self.hold(row, right_row, sender).await?;
             }
         }
         Ok(())
@@ -160,14 +164,21 @@ impl PairBuffer {
         self.push_rows(0..self.left_count, sender).await
     }
 
-    /// One pair, after the flush its arrival forces: `size` pairs held, or
-    /// its bytes would take the held pairs past the budget.
+    /// One pair, charged to the query's pair allowance, after the flush its
+    /// arrival forces.
     pub(super) async fn push(
         &mut self,
         left_row: u32,
         right_row: u32,
         sender: &BatchSender,
     ) -> DfResult<()> {
+        self.charge.charge_pairs(1)?;
+        self.hold(left_row, right_row, sender).await
+    }
+
+    /// One already charged pair, after the flush its arrival forces: `size`
+    /// pairs held, or its bytes would take the held pairs past the budget.
+    async fn hold(&mut self, left_row: u32, right_row: u32, sender: &BatchSender) -> DfResult<()> {
         let bytes =
             self.left_bytes[left_row as usize].saturating_add(self.right_bytes[right_row as usize]);
         let full = self.left_rows.len() == self.size

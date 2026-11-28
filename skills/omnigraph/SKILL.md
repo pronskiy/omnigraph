@@ -48,7 +48,8 @@ refused with `T5`. `$a $e:(knows | likes) $b` binds one-hop concrete edges, expo
 on every member; nullability and enum domains widen.
 
 `set traversal_work_limit = 1000000;` controls shared traversal row work in
-statements using selections. Full selected-table sizes count before scans, even
+statements using selections, and separately caps the pairs a `match` forms
+between bindings no edge connects (n × n for two bindings of n rows). Full selected-table sizes count before scans, even
 for selective neighborhoods. A result limit cannot replace this cap. Exhaustion
 terminates the query with an error; received rows do not become partial success.
 On a server a request cannot raise it past the server's ceiling (the larger of

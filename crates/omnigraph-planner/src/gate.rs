@@ -199,6 +199,12 @@ impl PlanSource for Recorded<'_> {
         limit
     }
 
+    fn pair_work_limit(&self) -> Option<u64> {
+        let limit = self.source.pair_work_limit();
+        self.read.borrow_mut().pair_work_limit = limit;
+        limit
+    }
+
     /// Recorded as the setting spells it: `0` is no cap.
     fn ann_nprobes(&self) -> Option<usize> {
         let nprobes = self.source.ann_nprobes();

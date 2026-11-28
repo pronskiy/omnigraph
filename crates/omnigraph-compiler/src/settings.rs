@@ -118,7 +118,7 @@ pub const DEFINITIONS: &[SettingSpec] = &[
         default: "1000000",
         scope: SettingScope::Request,
         env: "OMNIGRAPH_TRAVERSAL_WORK_LIMIT",
-        doc: "the finite work budget shared by edge selections in one query; exhaustion terminates the query with an error",
+        doc: "the finite work budget shared by edge selections in one query, and the separate cap on the pairs a cross join forms; exhaustion terminates the query with an error",
     },
     SettingSpec {
         name: "write_max_bytes",

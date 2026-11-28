@@ -619,6 +619,9 @@ fn resolve_pipeline(
                 match current {
                     None => filtered,
                     Some(left) => {
+                        // Every pair a cross join forms is charged to this
+                        // allowance; reading it records it in the plan.
+                        source.pair_work_limit();
                         let joined = join_schema(
                             &schema_of(plan, left)?,
                             binding_of(plan, left).as_deref(),
