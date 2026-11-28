@@ -126,6 +126,20 @@ during live deployment preflight for affected graphs. `cluster validate`,
 `plan`, and direct apply do not resolve it. Vector dimensions remain part of
 the graph schema.
 
+The reference can name only a variable the server's operator admits, and the
+key goes only to the host admitted for it, so a `config_manage` holder can
+neither point a provider at the server's bearer tokens or storage keys nor send
+a provider key to an endpoint of their choosing. By default `OPENAI_API_KEY`,
+`GEMINI_API_KEY` and `OPENROUTER_API_KEY` are admitted, each only for its
+provider's host (`api.openai.com`, `generativelanguage.googleapis.com`,
+`openrouter.ai`). Set `OMNIGRAPH_EMBED_API_KEY_VARS` in the server's environment
+to a comma-separated list to admit exactly those entries instead: `NAME=host`
+allows the key only for that host, and a bare `NAME` for any host. For the
+example above, `OMNIGRAPH_EMBED_API_KEY_VARS=EMBEDDING_API_KEY=api.example.com`.
+A set but empty list admits nothing. A reference outside the list, or a
+`base_url` on another host, refuses the graph's provider before the variable
+is read.
+
 See [Embeddings](../search/embeddings.md) for provider behavior.
 
 ## External Blob references

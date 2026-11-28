@@ -1672,6 +1672,10 @@ impl LiveBindingsFixture {
     fn envs(&self) -> Vec<(&str, &str)> {
         vec![
             ("OMNIGRAPH_LIFECYCLE_EMBED_KEY", "test-lifecycle-key"),
+            (
+                "OMNIGRAPH_EMBED_API_KEY_VARS",
+                "OMNIGRAPH_LIFECYCLE_EMBED_KEY",
+            ),
             ("OMNIGRAPH_EMBEDDINGS_MOCK", "0"),
             ("OMNIGRAPH_EMBED_RETRY_ATTEMPTS", "1"),
             ("OMNIGRAPH_EMBED_TIMEOUT_MS", "2000"),

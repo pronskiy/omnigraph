@@ -527,20 +527,46 @@ impl EmbeddingProviderConfig {
     /// reference from process env. Mock profiles do not read env and may omit
     /// `api_key`; real providers error if the reference is missing or unset.
     pub fn resolve(&self) -> Result<omnigraph::embedding::EmbeddingConfig, String> {
-        let api_key = if self.kind.as_deref() == Some("mock") {
-            String::new()
-        } else {
-            resolve_secret_ref(self.api_key.as_deref().ok_or_else(|| {
-                "embedding api_key is required for non-mock providers".to_string()
-            })?)?
-        };
-        omnigraph::embedding::EmbeddingConfig::from_parts(
+        self.resolve_with(&process_env)
+    }
+
+    /// [`Self::resolve`] over the environment `env` reads.
+    fn resolve_with(
+        &self,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<omnigraph::embedding::EmbeddingConfig, String> {
+        // The endpoint first, with a placeholder key: a key is read only
+        // after its reference is admitted and the endpoint it would be sent
+        // to is one the operator allows for it.
+        let mut config = omnigraph::embedding::EmbeddingConfig::from_parts(
             self.kind.as_deref(),
             self.base_url.clone(),
             self.model.clone(),
-            api_key,
+            String::new(),
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        if self.kind.as_deref() == Some("mock") {
+            return Ok(config);
+        }
+        let reference = self
+            .api_key
+            .as_deref()
+            .ok_or_else(|| "embedding api_key is required for non-mock providers".to_string())?;
+        let admitted = admitted_key_var(reference, env)?;
+        if let Some(host) = admitted.host {
+            let endpoint = endpoint_host(&config.base_url);
+            if endpoint != host {
+                return Err(format!(
+                    "embedding api_key env var '{}' may be sent only to {host}, and base_url \
+                     names {endpoint}; the server's operator binds a variable to a host in \
+                     {ADMITTED_KEY_VARS_ENV}",
+                    admitted.name
+                ));
+            }
+        }
+        config.api_key = env(admitted.name)
+            .ok_or_else(|| format!("embedding api_key env var '{}' is not set", admitted.name))?;
+        Ok(config)
     }
 }
 
@@ -556,11 +582,82 @@ fn secret_ref_name(value: &str) -> Result<&str, String> {
         })
 }
 
-/// Resolve a `${NAME}` secret reference from process env. Rejects an inline value
-/// (anything not wrapped in `${…}`) so secrets never sit in the cluster config.
-fn resolve_secret_ref(value: &str) -> Result<String, String> {
-    let name = secret_ref_name(value)?;
-    std::env::var(name).map_err(|_| format!("embedding api_key env var '{name}' is not set"))
+/// The variable that lists, comma-separated, the environment variables an
+/// embedding `api_key` reference may name, each as `NAME=host` to allow it
+/// only for that endpoint host or as `NAME` for any. It replaces
+/// [`DEFAULT_ADMITTED_KEY_VARS`] when set; set but empty, it admits nothing.
+pub const ADMITTED_KEY_VARS_ENV: &str = "OMNIGRAPH_EMBED_API_KEY_VARS";
+
+/// The provider key variables a reference may name when the operator lists
+/// none, the ones the engine itself reads, each only for its provider's host.
+pub const DEFAULT_ADMITTED_KEY_VARS: [(&str, &str); 3] = [
+    ("OPENAI_API_KEY", "api.openai.com"),
+    ("GEMINI_API_KEY", "generativelanguage.googleapis.com"),
+    ("OPENROUTER_API_KEY", "openrouter.ai"),
+];
+
+/// The process environment; a value that is not UTF-8 reads as empty, so an
+/// unreadable allowlist admits nothing instead of falling back to defaults.
+fn process_env(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => Some(String::new()),
+    }
+}
+
+/// An admitted reference: the variable, and the one host it may be sent to.
+struct AdmittedKey<'v> {
+    name: &'v str,
+    host: Option<String>,
+}
+
+/// The name a `${NAME}` reference names, refused unless the operator admits
+/// it. Cluster config is written by whoever holds `config_manage`, and the
+/// environment belongs to whoever runs the server, so a reference may reach
+/// only the variables the environment's owner lists, never the bearer-token
+/// table or object-store keys beside them, and an admitted key only the host
+/// it is bound to. The refusal comes before the variable is read, so it says
+/// nothing about whether it is set.
+fn admitted_key_var<'v>(
+    value: &'v str,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<AdmittedKey<'v>, String> {
+    let name = secret_ref_name(value)?.trim();
+    let host = match env(ADMITTED_KEY_VARS_ENV) {
+        Some(list) => list.split(',').find_map(|entry| {
+            let (listed, host) = match entry.split_once('=') {
+                Some((listed, host)) => (listed.trim(), Some(host.trim().to_ascii_lowercase())),
+                None => (entry.trim(), None),
+            };
+            (listed == name).then_some(host)
+        }),
+        None => DEFAULT_ADMITTED_KEY_VARS
+            .iter()
+            .find(|(listed, _)| *listed == name)
+            .map(|(_, host)| Some((*host).to_string())),
+    };
+    match host {
+        Some(host) => Ok(AdmittedKey { name, host }),
+        None => Err(format!(
+            "embedding api_key env var '{name}' is not admitted; the server's operator lists \
+             the variables a provider key may name in {ADMITTED_KEY_VARS_ENV}"
+        )),
+    }
+}
+
+/// The host of an endpoint URL, lowercased, without user info or port.
+fn endpoint_host(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = match host_port.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => host_port.split(':').next().unwrap_or_default(),
+    };
+    host.to_ascii_lowercase()
 }
 
 /// How a graph declares its stored queries. Terraform-style: the `.gq`
@@ -693,20 +790,139 @@ pub(crate) enum RecoverySidecarKind {
 mod embedding_provider_config_tests {
     use super::EmbeddingProviderConfig;
 
-    #[test]
-    fn resolves_secret_from_env_and_applies_defaults() {
-        // SAFETY: a unique var name, no concurrent reader.
-        unsafe { std::env::set_var("OG_TEST_EMBED_KEY_A", "secret-x") };
-        let profile = EmbeddingProviderConfig {
+    /// An environment of exactly `vars`.
+    fn env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        move |name| {
+            vars.iter()
+                .find(|(listed, _)| listed == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    fn profile(api_key: &str) -> EmbeddingProviderConfig {
+        EmbeddingProviderConfig {
             kind: Some("openai-compatible".to_string()),
             base_url: None,
             model: Some("m".to_string()),
-            api_key: Some("${OG_TEST_EMBED_KEY_A}".to_string()),
-        };
-        let config = profile.resolve().unwrap();
+            api_key: Some(api_key.to_string()),
+        }
+    }
+
+    #[test]
+    fn resolves_secret_from_env_and_applies_defaults() {
+        let config = profile("${OPENROUTER_API_KEY}")
+            .resolve_with(&env(&[("OPENROUTER_API_KEY", "secret-x")]))
+            .unwrap();
         assert_eq!(config.api_key, "secret-x");
         assert_eq!(config.model, "m");
-        unsafe { std::env::remove_var("OG_TEST_EMBED_KEY_A") };
+    }
+
+    /// A reference reaches only a variable the operator admits: by default the
+    /// provider key names, else exactly the list in
+    /// `OMNIGRAPH_EMBED_API_KEY_VARS`. Any other variable, set or not, is
+    /// refused before it is read, so the refusal neither sends it nor says
+    /// whether it exists.
+    #[test]
+    fn reference_reaches_only_an_admitted_variable() {
+        let server = [
+            (
+                "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+                "{\"actor\":\"token\"}",
+            ),
+            ("AWS_SECRET_ACCESS_KEY", "aws-secret"),
+            ("OPENAI_API_KEY", "provider-key"),
+        ];
+        for name in [
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            "AWS_SECRET_ACCESS_KEY",
+            "UNSET_ELSEWHERE",
+        ] {
+            let err = profile(&format!("${{{name}}}"))
+                .resolve_with(&env(&server))
+                .unwrap_err();
+            assert!(err.contains("not admitted"), "{name}: {err}");
+            assert!(err.contains(name), "{name}: {err}");
+            assert!(!err.contains("secret") && !err.contains("token\""), "{err}");
+        }
+        let listed = [
+            ("OMNIGRAPH_EMBED_API_KEY_VARS", " TEAM_EMBED_KEY ,OTHER"),
+            ("TEAM_EMBED_KEY", "team-key"),
+            ("OPENAI_API_KEY", "provider-key"),
+        ];
+        let config = profile("${TEAM_EMBED_KEY}")
+            .resolve_with(&env(&listed))
+            .unwrap();
+        assert_eq!(config.api_key, "team-key");
+        let err = profile("${OPENAI_API_KEY}")
+            .resolve_with(&env(&listed))
+            .unwrap_err();
+        assert!(
+            err.contains("not admitted"),
+            "a list replaces the defaults: {err}"
+        );
+        let empty = [
+            ("OMNIGRAPH_EMBED_API_KEY_VARS", ""),
+            ("OPENROUTER_API_KEY", "k"),
+        ];
+        let err = profile("${OPENROUTER_API_KEY}")
+            .resolve_with(&env(&empty))
+            .unwrap_err();
+        assert!(
+            err.contains("not admitted"),
+            "an empty list admits nothing: {err}"
+        );
+    }
+
+    /// An admitted key goes only to the host it is bound to: a default
+    /// provider key only to its provider, a listed `NAME=host` only to that
+    /// host, however the base_url disguises another one.
+    #[test]
+    fn an_admitted_key_reaches_only_its_bound_host() {
+        let with_base = |api_key: &str, base_url: &str| EmbeddingProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some(base_url.to_string()),
+            model: Some("m".to_string()),
+            api_key: Some(api_key.to_string()),
+        };
+        let server = [("OPENAI_API_KEY", "openai-key"), ("TEAM_KEY", "team-key")];
+        for base in [
+            "https://attacker.test/v1",
+            "https://api.openai.com@attacker.test/v1",
+            "https://api.openai.com.attacker.test/v1",
+        ] {
+            let err = with_base("${OPENAI_API_KEY}", base)
+                .resolve_with(&env(&server))
+                .unwrap_err();
+            assert!(
+                err.contains("may be sent only to api.openai.com"),
+                "{base}: {err}"
+            );
+            assert!(!err.contains("openai-key"), "{err}");
+        }
+        let config = with_base("${OPENAI_API_KEY}", "https://API.openai.com:443/v1")
+            .resolve_with(&env(&server))
+            .unwrap();
+        assert_eq!(config.api_key, "openai-key");
+        let listed = [
+            (
+                "OMNIGRAPH_EMBED_API_KEY_VARS",
+                "TEAM_KEY=embed.example.test",
+            ),
+            ("TEAM_KEY", "team-key"),
+        ];
+        assert!(
+            with_base("${TEAM_KEY}", "https://elsewhere.test/v1")
+                .resolve_with(&env(&listed))
+                .is_err()
+        );
+        let config = with_base("${TEAM_KEY}", "https://embed.example.test/v1")
+            .resolve_with(&env(&listed))
+            .unwrap();
+        assert_eq!(config.api_key, "team-key");
     }
 
     #[test]
@@ -731,24 +947,24 @@ mod embedding_provider_config_tests {
             kind: None,
             base_url: None,
             model: None,
-            api_key: Some("${OG_TEST_DEFINITELY_UNSET_VAR}".to_string()),
+            api_key: Some("${OPENROUTER_API_KEY}".to_string()),
         };
-        let err = profile.resolve().unwrap_err();
+        let err = profile.resolve_with(&env(&[])).unwrap_err();
         assert!(err.contains("not set"), "got: {err}");
     }
 
     #[test]
     fn rejects_unknown_provider() {
-        unsafe { std::env::set_var("OG_TEST_EMBED_KEY_B", "x") };
         let profile = EmbeddingProviderConfig {
             kind: Some("cohere".to_string()),
             base_url: None,
             model: None,
-            api_key: Some("${OG_TEST_EMBED_KEY_B}".to_string()),
+            api_key: Some("${OPENROUTER_API_KEY}".to_string()),
         };
-        let err = profile.resolve().unwrap_err();
+        let err = profile
+            .resolve_with(&env(&[("OPENROUTER_API_KEY", "x")]))
+            .unwrap_err();
         assert!(err.contains("unknown embedding provider"), "got: {err}");
-        unsafe { std::env::remove_var("OG_TEST_EMBED_KEY_B") };
     }
 
     #[test]

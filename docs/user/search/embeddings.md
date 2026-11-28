@@ -68,7 +68,13 @@ graphs:
 ```
 
 Inline API keys are rejected. `${ENV_VAR}` references are resolved when the
-server starts, not when the cluster configuration is planned or applied.
+server starts, not when the cluster configuration is planned or applied. A
+reference can name only `OPENAI_API_KEY`, `GEMINI_API_KEY` or
+`OPENROUTER_API_KEY`, each sent only to its provider's host, or exactly the
+`NAME` or `NAME=host` entries the server's `OMNIGRAPH_EMBED_API_KEY_VARS` lists.
+Any other name, or a `base_url` on a host the entry does not allow, is refused
+before the variable is read
+([cluster config](../clusters/config.md#embedding-providers)).
 
 ## Schema annotation
 

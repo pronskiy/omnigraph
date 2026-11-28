@@ -266,7 +266,12 @@ are `OMNIGRAPH_EMBED_DEADLINE_MS`, `OMNIGRAPH_EMBED_TIMEOUT_MS`,
 
 For a served graph, declare a named provider under `providers.embedding` in
 `cluster.yaml` and bind it with `graphs.<id>.embedding_provider`. API keys must
-be `${ENV_VAR}` references and are resolved by the server at startup. Generated
+be `${ENV_VAR}` references and are resolved by the server at startup. A
+reference may name only `OPENAI_API_KEY`, `GEMINI_API_KEY` or
+`OPENROUTER_API_KEY` (each only with its provider's own `base_url` host), or
+exactly the `NAME` / `NAME=host` entries the server's
+`OMNIGRAPH_EMBED_API_KEY_VARS` lists; ask the operator to admit any other name
+or host rather than renaming a different secret. Generated
 vectors are finite, nonzero, and L2-normalized.
 
 A full-text call can fail with HTTP `409` before any scan.
