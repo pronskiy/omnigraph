@@ -143,6 +143,23 @@ warn and use the default; zero capacity refuses the corresponding lane.
 
 The default ingress allowances total 320 MiB across the independent lanes;
 configure both byte limits when setting an instance's input budget.
+
+The listener holds at most `OMNIGRAPH_MAX_CONNECTIONS` connections at once
+(default: half the process's open-file limit, between 16 and 4096); a peer past
+the cap waits in the accept queue until a connection closes, with no refusal. A
+connection must deliver each request's complete headers within
+`OMNIGRAPH_HEADER_TIMEOUT_SECONDS` (default 30) of being ready to read them,
+from accept for its first request and from the end of the previous response
+after that, or it is closed; this is also the keep-alive idle limit. A
+connection whose client stops reading a response is closed once one write has
+waited on it for `OMNIGRAPH_WRITE_STALL_TIMEOUT_SECONDS` (default 60), which
+drops the response and releases what it held: its request's hold on the graph,
+which a deployment drains, and an export's slot. Unlike the variables above, an
+invalid value of any of the three refuses startup. These bounds stop
+peers that connect and send nothing from holding descriptors. A load balancer
+that reuses idle upstream connections must close them sooner than this limit
+(for example, an idle timeout of 60 seconds needs a header timeout above 60).
+
 Body timeouts above 86400 seconds also warn and use the 30-second default.
 Ingress reserves the route's maximum before reading, then reduces the reservation
 to the actual body size. Body collection limits remain 1 MiB for ordinary JSON

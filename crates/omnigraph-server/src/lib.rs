@@ -11,6 +11,7 @@ mod handlers;
 mod http_contract;
 mod http_operations;
 mod ingress;
+mod listener;
 mod recorded_operations;
 pub use recorded_operations::OperationSettings;
 mod mcp;
@@ -4320,6 +4321,7 @@ async fn serve_config(
         }
         None => state,
     };
+    let listener_limits = listener::ListenerLimits::from_env()?;
     let listener = TcpListener::bind(&bind).await?;
     let listen_addr = listener.local_addr()?;
     {
@@ -4376,15 +4378,14 @@ async fn serve_config(
         result
     });
     let mut shutdown_rx = shutdown_rx;
-    let served = axum::serve(listener, build_app(state))
-        .with_graceful_shutdown(async move {
-            while !*shutdown_rx.borrow() {
-                if shutdown_rx.changed().await.is_err() {
-                    break;
-                }
+    let served = listener::serve(listener, build_app(state), listener_limits, async move {
+        while !*shutdown_rx.borrow() {
+            if shutdown_rx.changed().await.is_err() {
+                break;
             }
-        })
-        .await;
+        }
+    })
+    .await;
     if served.is_err() {
         operations.close();
         listener_failed.notify_one();
@@ -4418,9 +4419,9 @@ async fn serve_config(
                 "storage completion uncertain; retaining cluster admission"
             ));
         }
-        // Axum's connection completion notification can precede destruction
-        // of its Hyper service and AppState. Drain those actual owners too;
-        // the original process watchdog still bounds this wait.
+        // A connection's slot can be released before its Hyper service and
+        // AppState are destroyed. Drain those actual owners too; the original
+        // process watchdog still bounds this wait.
         owner.wait_for_exclusive_owner().await;
         owner
             .release_after_settlement()

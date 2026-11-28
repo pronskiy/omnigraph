@@ -5751,6 +5751,8 @@ dependencies = [
  "futures",
  "headers",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "jsonwebtoken",
  "lance",
  "libc",

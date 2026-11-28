@@ -43,6 +43,8 @@ futures = { workspace = true }
 url = { workspace = true }
 headers = "0.4.1"
 http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 p256 = { version = "0.14", features = ["ecdsa", "pem"] }
